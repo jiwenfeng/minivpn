@@ -29,7 +29,7 @@ extern int g_log_level;
  * 线程安全日志输出宏
  * flockfile/funlockfile 确保单条日志的时间戳和内容不被其他线程打断
  */
-#define LOG_PRINT(level_str, fmt, ...)                                   \
+#define LOG_PRINT(level_str, ...)                                        \
     do {                                                                 \
         time_t _log_t = time(NULL);                                      \
         struct tm _log_tm;                                               \
@@ -38,29 +38,30 @@ extern int g_log_level;
         strftime(_log_buf, sizeof(_log_buf), "%Y-%m-%d %H:%M:%S",       \
                  &_log_tm);                                              \
         flockfile(stderr);                                               \
-        fprintf(stderr, "[%s][%s] " fmt "\n", _log_buf, level_str,      \
-                ##__VA_ARGS__);                                          \
+        fprintf(stderr, "[%s][%s] ", _log_buf, level_str);               \
+        fprintf(stderr, __VA_ARGS__);                                    \
+        fprintf(stderr, "\n");                                           \
         fflush_unlocked(stderr);                                         \
         funlockfile(stderr);                                             \
     } while (0)
 
 /* 各级别日志宏 */
-#define log_error(fmt, ...)                                              \
+#define log_error(...)                                                   \
     do {                                                                 \
         if (g_log_level >= LOG_ERROR)                                    \
-            LOG_PRINT("ERROR", fmt, ##__VA_ARGS__);                      \
+            LOG_PRINT("ERROR", __VA_ARGS__);                             \
     } while (0)
 
-#define log_info(fmt, ...)                                               \
+#define log_info(...)                                                    \
     do {                                                                 \
         if (g_log_level >= LOG_INFO)                                     \
-            LOG_PRINT("INFO ", fmt, ##__VA_ARGS__);                      \
+            LOG_PRINT("INFO ", __VA_ARGS__);                             \
     } while (0)
 
-#define log_debug(fmt, ...)                                              \
+#define log_debug(...)                                                   \
     do {                                                                 \
         if (g_log_level >= LOG_DEBUG)                                    \
-            LOG_PRINT("DEBUG", fmt, ##__VA_ARGS__);                      \
+            LOG_PRINT("DEBUG", __VA_ARGS__);                             \
     } while (0)
 
 #endif /* MINIVPN_LOG_H */

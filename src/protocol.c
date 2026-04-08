@@ -210,7 +210,7 @@ static int hmac_sha256_oneshot(const uint8_t *key, int key_len,
 
     OSSL_PARAM params[] = {
         OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST, "SHA256", 0),
-        OSSL_PARAM_construct_END()
+        OSSL_PARAM_END
     };
 
     int ret = -1;
@@ -290,7 +290,7 @@ static int hkdf_expand(const uint8_t *prk, int prk_len,
 
     OSSL_PARAM params[] = {
         OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST, "SHA256", 0),
-        OSSL_PARAM_construct_END()
+        OSSL_PARAM_END
     };
 
     /* 创建一个 EVP_MAC_CTX，循环内复用 */
