@@ -15,7 +15,6 @@
  * - 密钥安全擦除使用 OPENSSL_cleanse
  */
 
-#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
