@@ -212,6 +212,15 @@ static int client_authenticate(struct worker *w)
             }
 
             for (int i = 0; i < nfds; i++) {
+                /* 认证阶段排空 TUN 数据，防止 level-triggered 忙等 */
+                if (events[i].data.fd == w->tun_fd &&
+                    (events[i].events & EPOLLIN)) {
+                    uint8_t discard[2048];
+                    while (read(w->tun_fd, discard, sizeof(discard)) > 0)
+                        ;  /* drain */
+                    continue;
+                }
+
                 if (events[i].data.fd != w->udp_fd) continue;
                 if (!(events[i].events & EPOLLIN)) continue;
 
