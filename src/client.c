@@ -165,15 +165,15 @@ static int client_authenticate(struct worker *w)
     uint8_t frame_buf[MAX_FRAME_SIZE];
     uint8_t recv_buf[MAX_FRAME_SIZE];
 
-    /* 生成 AUTH 帧内容 */
-    if (protocol_make_auth(w->crypto, auth_payload, &auth_payload_len) != 0) {
-        log_error("client worker[%d]: 生成 AUTH 帧失败", w->id);
-        return -1;
-    }
-
     for (int retry = 0; retry < AUTH_RETRY_MAX; retry++) {
         if (!__atomic_load_n(&w->running, __ATOMIC_SEQ_CST) || !g_client_running)
             return -1;
+
+        /* 每次重试都生成新的 AUTH 帧内容（刷新时间戳和 nonce） */
+        if (protocol_make_auth(w->crypto, auth_payload, &auth_payload_len) != 0) {
+            log_error("client worker[%d]: 生成 AUTH 帧失败", w->id);
+            return -1;
+        }
 
         /* 加密 AUTH 帧 */
         int enc_len = protocol_encrypt(w->crypto, FRAME_AUTH,
@@ -240,7 +240,10 @@ static int client_authenticate(struct worker *w)
         log_info("client worker[%d]: 等待 OK 超时，重试...", w->id);
     }
 
-    log_error("client worker[%d]: AUTH 认证失败，超过最大重试次数", w->id);
+    log_error("client worker[%d]: AUTH 认证失败，超过最大重试次数 (%d 次, 每次超时 %d 秒)",
+              w->id, AUTH_RETRY_MAX, AUTH_TIMEOUT);
+    log_error("client worker[%d]: 请检查: 1) 服务端是否运行 2) 防火墙/安全组是否放行 UDP 端口"
+              " 3) 两端 secret 密钥是否一致", w->id);
     return -1;
 }
 

@@ -138,8 +138,12 @@ static void *server_worker_thread(void *arg)
                     if (protocol_decrypt(w->crypto, udp_recv_bufs[j], n,
                                          &frame_type, decrypt_payload,
                                          &payload_len) != 0) {
-                        log_debug("server worker[%d]: 解密失败，丢弃帧",
-                                  w->id);
+                        char src_str[INET6_ADDRSTRLEN + 8];
+                        sockaddr_to_str(&src_addrs[j], src_str,
+                                        sizeof(src_str));
+                        log_error("server worker[%d]: 解密失败 (%d 字节), 来自 %s"
+                                  " (密钥不匹配或数据损坏)",
+                                  w->id, n, src_str);
                         continue;
                     }
 
@@ -181,10 +185,19 @@ static void *server_worker_thread(void *arg)
                                                       ctrl_send_buf,
                                                       sizeof(ctrl_send_buf));
                         if (ok_len > 0) {
-                            sendto(w->udp_fd, ctrl_send_buf, ok_len, 0,
-                                   (struct sockaddr *)&src_addrs[j],
-                                   addr_len);
-                            log_debug("server worker[%d]: 已发送 OK 帧",
+                            ssize_t ok_sent = sendto(w->udp_fd, ctrl_send_buf,
+                                                     ok_len, 0,
+                                                     (struct sockaddr *)&src_addrs[j],
+                                                     addr_len);
+                            if (ok_sent < 0) {
+                                log_error("server worker[%d]: 发送 OK 帧失败: %s",
+                                          w->id, strerror(errno));
+                            } else {
+                                log_info("server worker[%d]: 已发送 OK 帧到 %s",
+                                         w->id, addr_str);
+                            }
+                        } else {
+                            log_error("server worker[%d]: 加密 OK 帧失败",
                                       w->id);
                         }
                         break;
