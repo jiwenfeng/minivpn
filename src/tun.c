@@ -2,19 +2,23 @@
  * MiniVPN - Linux TUN 设备实现
  *
  * 使用 /dev/net/tun + ioctl 创建和配置 TUN 设备
+ * 支持 IPv4 和 IPv6 地址配置
  */
 
 #include "tun.h"
 #include "log.h"
 
+#include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/wait.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <net/if.h>
 #include <linux/if_tun.h>
 #include <arpa/inet.h>
+#include <netinet/in.h>
 
 int tun_create(char *dev_name, int dev_name_size)
 {
@@ -121,7 +125,93 @@ int tun_configure(const char *dev_name, const char *local_ip, const char *peer_i
     }
 
     close(sock);
-    log_info("TUN 设备 %s 配置完成: %s -> %s", dev_name, local_ip, peer_ip);
+    log_info("TUN 设备 %s IPv4 配置完成: %s -> %s", dev_name, local_ip, peer_ip);
+    return 0;
+}
+
+/*
+ * 验证 IPv6 地址格式是否安全（仅允许 hex 数字、冒号和点）
+ * 防止 system() 命令注入
+ */
+static int validate_ipv6_addr(const char *addr)
+{
+    for (const char *p = addr; *p; p++) {
+        char c = *p;
+        if ((c >= '0' && c <= '9') ||
+            (c >= 'a' && c <= 'f') ||
+            (c >= 'A' && c <= 'F') ||
+            c == ':' || c == '.') {
+            continue;
+        }
+        return -1;  /* 包含非法字符 */
+    }
+    return 0;
+}
+
+/*
+ * 验证网卡名称是否安全（仅允许字母、数字和下划线）
+ */
+static int validate_dev_name(const char *name)
+{
+    for (const char *p = name; *p; p++) {
+        char c = *p;
+        if ((c >= '0' && c <= '9') ||
+            (c >= 'a' && c <= 'z') ||
+            (c >= 'A' && c <= 'Z') ||
+            c == '_' || c == '-') {
+            continue;
+        }
+        return -1;
+    }
+    return 0;
+}
+
+int tun_configure_ipv6(const char *dev_name, const char *local_ip6,
+                       int prefix_len)
+{
+    if (!dev_name || !local_ip6) {
+        log_error("tun_configure_ipv6: 参数为空");
+        return -1;
+    }
+    if (prefix_len <= 0 || prefix_len > 128) {
+        log_error("tun_configure_ipv6: 前缀长度无效: %d", prefix_len);
+        return -1;
+    }
+
+    /* 输入验证：防止命令注入 */
+    if (validate_ipv6_addr(local_ip6) != 0) {
+        log_error("tun_configure_ipv6: IPv6 地址包含非法字符: %s", local_ip6);
+        return -1;
+    }
+    if (validate_dev_name(dev_name) != 0) {
+        log_error("tun_configure_ipv6: 设备名包含非法字符: %s", dev_name);
+        return -1;
+    }
+
+    /*
+     * 使用 ip 命令配置 IPv6 地址（比 ioctl 更简洁可靠）
+     * ioctl 对 IPv6 支持有限，netlink 或 ip 命令更合适
+     */
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd),
+             "ip -6 addr add %s/%d dev %s 2>&1",
+             local_ip6, prefix_len, dev_name);
+
+    int ret = system(cmd);
+    if (ret != 0) {
+        /* 错误码 2 通常表示地址已存在 (RTNETLINK answers: File exists)，可忽略 */
+        if (WIFEXITED(ret) && WEXITSTATUS(ret) == 2) {
+            log_info("tun_configure_ipv6: IPv6 地址已存在，跳过: %s/%d",
+                     local_ip6, prefix_len);
+        } else {
+            log_error("tun_configure_ipv6: 配置 IPv6 地址失败 (exit=%d): %s/%d",
+                      WIFEXITED(ret) ? WEXITSTATUS(ret) : -1,
+                      local_ip6, prefix_len);
+            return -1;
+        }
+    }
+
+    log_info("TUN 设备 %s IPv6 配置完成: %s/%d", dev_name, local_ip6, prefix_len);
     return 0;
 }
 

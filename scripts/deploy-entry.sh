@@ -5,6 +5,7 @@ set -e
 # deploy-entry.sh - MiniVPN 近端（国内入口）一键部署脚本
 # 用法: ./deploy-entry.sh -r <远端IP:端口> -k <隧道密钥> --vpn-psk <VPN预共享密钥>
 #       [--add-user user:pass] [--tun-ip <ip>] [--tun-peer <ip>]
+#       [--tun-ip6 <ip6>] [--tun-peer6 <ip6>] [-6]
 # 面向: Ubuntu 22.04+ / Debian 12+
 ###############################################################################
 
@@ -25,7 +26,12 @@ SECRET=""            # 隧道密钥
 VPN_PSK=""           # L2TP/IPsec 预共享密钥
 TUN_IP="172.16.0.2"  # 近端TUN IP（client端）
 TUN_PEER="172.16.0.1" # 远端TUN IP（server端）
+TUN_IP6=""           # IPv6 TUN 本端地址（可选）
+TUN_PEER6=""         # IPv6 TUN 对端地址（可选）
+TUN_IP6_PREFIX=64    # IPv6 前缀长度
+USE_IPV6=0           # 是否使用 IPv6 连接远端
 ADD_USERS=()         # 要添加的用户列表 user:pass
+TUN_DEV="tun0"       # TUN 设备名（需与 minivpn 创建的一致）
 SRC_DIR="/opt/minivpn"
 CONF_DIR="/etc/minivpn"
 CONF_FILE="${CONF_DIR}/minivpn.conf"
@@ -44,18 +50,22 @@ usage() {
 用法: $0 -r <远端IP:端口> -k <隧道密钥> --vpn-psk <VPN预共享密钥> [选项]
 
 必须参数:
-  -r, --remote <IP:PORT>         远端服务器地址和端口（如 1.2.3.4:4567）
+  -r, --remote <IP:PORT>         远端服务器地址和端口（如 1.2.3.4:4567 或 [::1]:4567）
   -k, --key <secret>             隧道预共享密钥
   --vpn-psk <psk>                L2TP/IPsec VPN 预共享密钥
 
 可选参数:
   --add-user <user:pass>         添加VPN用户（可多次使用）
-  --tun-ip <ip>                  本端TUN接口IP（默认: 172.16.0.2）
-  --tun-peer <ip>                对端TUN接口IP（默认: 172.16.0.1）
+  --tun-ip <ip>                  本端TUN接口IPv4（默认: 172.16.0.2）
+  --tun-peer <ip>                对端TUN接口IPv4（默认: 172.16.0.1）
+  --tun-ip6 <ip6>                本端TUN接口IPv6（可选，如 fd00::2）
+  --tun-peer6 <ip6>              对端TUN接口IPv6（可选，如 fd00::1）
+  -6, --ipv6                     使用IPv6连接远端
   -h, --help                     显示此帮助信息
 
 示例:
   $0 -r 1.2.3.4:4567 -k mysecret --vpn-psk myvpnpsk --add-user alice:password123
+  $0 -r [2001:db8::1]:4567 -6 -k mysecret --vpn-psk mypsk --tun-ip6 fd00::2
 EOF
 }
 
@@ -87,6 +97,18 @@ parse_args() {
                 TUN_PEER="$2"
                 shift 2
                 ;;
+            --tun-ip6)
+                TUN_IP6="$2"
+                shift 2
+                ;;
+            --tun-peer6)
+                TUN_PEER6="$2"
+                shift 2
+                ;;
+            -6|--ipv6)
+                USE_IPV6=1
+                shift
+                ;;
             -h|--help)
                 usage
                 exit 0
@@ -101,11 +123,22 @@ parse_args() {
     [[ -z "$SECRET" ]]      && fatal "必须指定隧道密钥，使用 -k <secret>"
     [[ -z "$VPN_PSK" ]]     && fatal "必须指定VPN预共享密钥，使用 --vpn-psk <psk>"
 
-    # 解析远端地址
-    REMOTE_IP=$(echo "$REMOTE_ADDR" | cut -d: -f1)
-    REMOTE_PORT=$(echo "$REMOTE_ADDR" | cut -d: -f2)
+    # 解析远端地址（支持 IPv4 和 IPv6 [addr]:port 格式）
+    if [[ "$REMOTE_ADDR" =~ ^\[(.+)\]:([0-9]+)$ ]]; then
+        # IPv6 格式: [addr]:port
+        REMOTE_IP="${BASH_REMATCH[1]}"
+        REMOTE_PORT="${BASH_REMATCH[2]}"
+        USE_IPV6=1
+    elif [[ "$REMOTE_ADDR" =~ ^([^:]+):([0-9]+)$ ]]; then
+        # IPv4 格式: addr:port
+        REMOTE_IP="${BASH_REMATCH[1]}"
+        REMOTE_PORT="${BASH_REMATCH[2]}"
+    else
+        fatal "远端地址格式不正确，应为 IP:PORT 或 [IPv6]:PORT 格式"
+    fi
+
     if [[ -z "$REMOTE_IP" || -z "$REMOTE_PORT" ]]; then
-        fatal "远端地址格式不正确，应为 IP:PORT 格式"
+        fatal "远端地址解析失败"
     fi
 }
 
@@ -155,12 +188,27 @@ create_minivpn_config() {
 # 由 deploy-entry.sh 自动生成于 $(date '+%Y-%m-%d %H:%M:%S')
 
 mode = client
-remote = ${REMOTE_IP}:${REMOTE_PORT}
+remote = ${REMOTE_ADDR}
 secret = ${SECRET}
 tun_ip = ${TUN_IP}
 tun_peer = ${TUN_PEER}
-log_level = 1
 EOF
+
+    # 添加 IPv6 TUN 配置（如果指定）
+    if [[ -n "$TUN_IP6" ]]; then
+        cat >> "$CONF_FILE" <<EOF
+tun_ip6 = ${TUN_IP6}
+tun_ip6_prefix = ${TUN_IP6_PREFIX}
+EOF
+    fi
+    if [[ -n "$TUN_PEER6" ]]; then
+        echo "tun_peer6 = ${TUN_PEER6}" >> "$CONF_FILE"
+    fi
+    if [[ "$USE_IPV6" -eq 1 ]]; then
+        echo "ipv6 = yes" >> "$CONF_FILE"
+    fi
+
+    echo "log_level = 1" >> "$CONF_FILE"
 
     chmod 600 "$CONF_FILE"
     info "minivpn 配置文件创建完成"
@@ -184,7 +232,10 @@ config setup
 conn l2tp
     type=transport
     authby=secret
-    rekey=no
+    rekey=yes
+    ikelifetime=24h
+    lifetime=24h
+    forceencaps=yes
     left=%defaultroute
     leftprotoport=17/1701
     right=%any
@@ -232,10 +283,15 @@ configure_ppp() {
 
     mkdir -p /etc/ppp
 
+    # DNS 分流说明：
+    # - 主 DNS 使用国内公共 DNS（阿里 223.5.5.5、腾讯 119.29.29.29），
+    #   确保国内域名解析到国内 CDN 节点，避免绕路到海外 DNS
+    # - 国外域名的解析由隧道对端 DNS 或客户端自行处理
+    # MTU 1280: 满足 IPv6 最低 MTU 要求，同时兼顾 L2TP/IPsec 头部开销
     cat > /etc/ppp/options.xl2tpd <<'PPP_OPTS'
 require-mschap-v2
-ms-dns 8.8.8.8
-ms-dns 1.1.1.1
+ms-dns 223.5.5.5
+ms-dns 119.29.29.29
 asyncmap 0
 auth
 lock
@@ -245,8 +301,8 @@ name l2tpd
 proxyarp
 lcp-echo-interval 30
 lcp-echo-failure 4
-mtu 1400
-mru 1400
+mtu 1280
+mru 1280
 PPP_OPTS
 
     # 确保 chap-secrets 文件存在
@@ -258,7 +314,7 @@ CHAP
         chmod 600 /etc/ppp/chap-secrets
     fi
 
-    info "PPP 配置完成"
+    info "PPP 配置完成（MTU=1280）"
 }
 
 # ─── 函数：添加VPN用户 ──────────────────────────────────────────────────────
@@ -291,19 +347,26 @@ add_vpn_users() {
 
 # ─── 函数：开启IP转发 ────────────────────────────────────────────────────────
 enable_ip_forward() {
-    info "开启IPv4转发..."
+    info "开启IP转发..."
 
     sysctl -w net.ipv4.ip_forward=1
 
     local sysctl_conf="/etc/sysctl.d/99-minivpn.conf"
-    if [[ -f "$sysctl_conf" ]] && grep -q "net.ipv4.ip_forward=1" "$sysctl_conf"; then
-        info "IP转发配置已存在，跳过"
-    else
-        echo "net.ipv4.ip_forward=1" > "$sysctl_conf"
-        sysctl --system > /dev/null 2>&1
-    fi
+    cat > "$sysctl_conf" <<'EOF'
+net.ipv4.ip_forward=1
+net.ipv6.conf.all.forwarding=1
+net.ipv6.conf.default.forwarding=1
+EOF
+    sysctl --system > /dev/null 2>&1
 
-    info "IP转发已开启"
+    # IPv6 转发
+    if [[ -n "$TUN_IP6" ]]; then
+        sysctl -w net.ipv6.conf.all.forwarding=1
+        sysctl -w net.ipv6.conf.default.forwarding=1
+        info "IPv4 和 IPv6 转发已开启"
+    else
+        info "IPv4 转发已开启"
+    fi
 }
 
 # ─── 函数：获取默认出口网卡 ─────────────────────────────────────────────────
@@ -323,10 +386,18 @@ setup_iptables() {
     local iface
     iface=$(get_default_iface)
 
+    # === IPv4 规则 ===
+
+    # mangle 规则：对来自 PPP 客户端子网的流量打 fwmark 标记
+    # fwmark 100 配合 ip rule / ip route table 200 (CN直连) + table 201 (隧道) 实现分流
+    if ! iptables -t mangle -C PREROUTING -s 10.10.10.0/24 -j MARK --set-mark 100 2>/dev/null; then
+        iptables -t mangle -A PREROUTING -s 10.10.10.0/24 -j MARK --set-mark 100
+        info "已添加 mangle 分流规则（PPP 客户端流量打标记 fwmark=100）"
+    fi
+
     # L2TP VPN 客户端子网 NAT
-    # 将VPN客户端的流量通过隧道转发出去
-    if ! iptables -t nat -C POSTROUTING -s 10.10.10.0/24 -o tun0 -j MASQUERADE 2>/dev/null; then
-        iptables -t nat -A POSTROUTING -s 10.10.10.0/24 -o tun0 -j MASQUERADE
+    if ! iptables -t nat -C POSTROUTING -s 10.10.10.0/24 -o "$TUN_DEV" -j MASQUERADE 2>/dev/null; then
+        iptables -t nat -A POSTROUTING -s 10.10.10.0/24 -o "$TUN_DEV" -j MASQUERADE
     fi
 
     # 也允许通过默认网卡的NAT（用于国内直连流量）
@@ -359,13 +430,56 @@ setup_iptables() {
         iptables -A INPUT -p udp --dport 1701 -j ACCEPT
     fi
 
+    # TCP MSS Clamping（避免 MTU 问题导致分片）
+    if ! iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
+        iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    fi
+
+    # === IPv6 规则（如果指定了 TUN IPv6 地址） ===
+    if [[ -n "$TUN_IP6" ]]; then
+        local tun6_subnet="${TUN_IP6}/${TUN_IP6_PREFIX}"
+        info "配置 ip6tables 规则 (TUN IPv6: ${tun6_subnet})..."
+
+        # IPv6 NAT（MASQUERADE）
+        if ! ip6tables -t nat -C POSTROUTING -s "$tun6_subnet" -o "$iface" -j MASQUERADE 2>/dev/null; then
+            ip6tables -t nat -A POSTROUTING -s "$tun6_subnet" -o "$iface" -j MASQUERADE 2>/dev/null || true
+        fi
+
+        # IPv6 FORWARD 规则
+        if ! ip6tables -C FORWARD -s "$tun6_subnet" -j ACCEPT 2>/dev/null; then
+            ip6tables -A FORWARD -s "$tun6_subnet" -j ACCEPT
+        fi
+        if ! ip6tables -C FORWARD -d "$tun6_subnet" -j ACCEPT 2>/dev/null; then
+            ip6tables -A FORWARD -d "$tun6_subnet" -j ACCEPT
+        fi
+
+        # IPv6 放行 IPsec 端口
+        if ! ip6tables -C INPUT -p udp --dport 500 -j ACCEPT 2>/dev/null; then
+            ip6tables -A INPUT -p udp --dport 500 -j ACCEPT
+        fi
+        if ! ip6tables -C INPUT -p udp --dport 4500 -j ACCEPT 2>/dev/null; then
+            ip6tables -A INPUT -p udp --dport 4500 -j ACCEPT
+        fi
+        if ! ip6tables -C INPUT -p udp --dport 1701 -j ACCEPT 2>/dev/null; then
+            ip6tables -A INPUT -p udp --dport 1701 -j ACCEPT
+        fi
+
+        # IPv6 MSS Clamping
+        if ! ip6tables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
+            ip6tables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+        fi
+
+        info "ip6tables 规则配置完成"
+    fi
+
     # 保存iptables规则
     echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections 2>/dev/null || true
     echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections 2>/dev/null || true
     apt install -y iptables-persistent
     iptables-save > /etc/iptables/rules.v4
+    ip6tables-save > /etc/iptables/rules.v6
 
-    info "iptables 规则配置完成"
+    info "iptables 规则配置完成（IPv4 + IPv6）"
 }
 
 # ─── 函数：初始化智能路由 ────────────────────────────────────────────────────
@@ -406,6 +520,14 @@ ExecStart=/usr/local/bin/minivpn -f ${CONF_FILE}
 Restart=always
 RestartSec=5
 LimitNOFILE=65536
+
+# 安全加固
+ProtectHome=yes
+ReadWritePaths=/dev/net/tun
+PrivateTmp=yes
+
+# TUN 设备配置需要 CAP_NET_ADMIN（ioctl SIOCSIFADDR/SIOCSIFMTU 等）
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
 
 [Install]
 WantedBy=multi-user.target
@@ -489,14 +611,21 @@ show_summary() {
     echo ""
     echo -e "  本机IP:           ${public_ip:-未知}"
     echo -e "  远端隧道:         ${REMOTE_ADDR}"
-    echo -e "  TUN本端IP:       ${TUN_IP}"
-    echo -e "  TUN对端IP:       ${TUN_PEER}"
+    echo -e "  TUN本端IPv4:     ${TUN_IP}"
+    echo -e "  TUN对端IPv4:     ${TUN_PEER}"
+    if [[ -n "$TUN_IP6" ]]; then
+        echo -e "  TUN本端IPv6:     ${TUN_IP6}/${TUN_IP6_PREFIX}"
+    fi
+    if [[ -n "$TUN_PEER6" ]]; then
+        echo -e "  TUN对端IPv6:     ${TUN_PEER6}"
+    fi
     echo ""
     echo -e "  ${YELLOW}── L2TP/IPsec VPN 客户端配置 ──${NC}"
     echo -e "  服务器地址:       ${public_ip:-<此服务器IP>}"
     echo -e "  VPN类型:          L2TP/IPsec PSK"
     echo -e "  预共享密钥:       ${VPN_PSK}"
     echo -e "  PPP用户子网:      10.10.10.0/24"
+    echo -e "  PPP MTU:          1280"
     echo ""
     if [[ ${#ADD_USERS[@]} -gt 0 ]]; then
         echo -e "  ${YELLOW}── 已添加的VPN用户 ──${NC}"

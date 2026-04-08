@@ -5,7 +5,7 @@
 | # | 需求 | 方案 |
 |---|------|------|
 | 1 | 对抗封锁 | 两跳架构：L2TP仅国内段；跨境用自定义UDP+AES-GCM+随机填充 |
-| 2 | 系统自带VPN | L2TP/IPsec PSK，6平台原生支持 |
+| 2 | 系统自带VPN | L2TP/IPsec PSK，7平台原生支持 |
 | 3 | 不装证书 | PSK模式，客户端只需：地址+密钥+用户名+密码 |
 | 4 | 高效率 | C语言+UDP+AES-NI硬件加速+多隧道多线程 |
 
@@ -126,7 +126,7 @@ ip rule add fwmark 100 lookup 201 prio 200   # 其余走隧道
 
 | 平台 | 路径 |
 |------|------|
-| iOS | 设置 > VPN > 添加 > L2TP |
+| iOS / iPadOS | 设置 > VPN > 添加 > L2TP |
 | macOS | 系统设置 > 网络 > VPN > L2TP |
 | Windows | 设置 > 网络 > VPN > L2TP/IPsec PSK |
 | Android/HarmonyOS | 设置 > VPN > L2TP/IPsec PSK |
@@ -213,4 +213,4 @@ curl -sL .../deploy-entry.sh | bash -s -- \
 ### 阶段三: 文档
 13. `README.md`
 14. `minivpn.conf.example`
-15. `client-guide.md` - 6平台配置指南
+15. `client-guide.md` - 7平台配置指南

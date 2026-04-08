@@ -2,9 +2,9 @@
 set -e
 
 ###############################################################################
-# update-routes.sh - APNIC中国大陆IP路由更新脚本
+# update-routes.sh - APNIC中国大陆IP路由更新脚本（IPv4 + IPv6）
 # 用法: ./update-routes.sh
-# 功能: 从APNIC获取中国大陆IP段，更新Linux策略路由表（热更新，无需重启服务）
+# 功能: 从APNIC获取中国大陆IPv4/IPv6段，更新Linux策略路由表（热更新，无需重启）
 # 面向: Ubuntu 22.04+ / Debian 12+
 ###############################################################################
 
@@ -26,7 +26,8 @@ ROUTE_TABLE_TUNNEL=201     # 其他流量走隧道的路由表
 FWMARK=100                 # iptables fwmark 标记值
 DATA_DIR="/var/lib/minivpn"
 APNIC_FILE="${DATA_DIR}/delegated-apnic-latest"
-BATCH_FILE="${DATA_DIR}/routes-cn.batch"
+BATCH_FILE_V4="${DATA_DIR}/routes-cn-v4.batch"
+BATCH_FILE_V6="${DATA_DIR}/routes-cn-v6.batch"
 LOG_FILE="/var/log/minivpn-routes.log"
 TUN_DEV="tun0"
 
@@ -37,19 +38,33 @@ check_root() {
     fi
 }
 
-# ─── 函数：获取默认网关和网卡 ────────────────────────────────────────────────
+# ─── 函数：获取IPv4默认网关和网卡 ────────────────────────────────────────────
 get_default_route() {
     DEFAULT_GW=$(ip route show default | awk '/default/ {print $3}' | head -n1)
     DEFAULT_IFACE=$(ip route show default | awk '/default/ {print $5}' | head -n1)
 
     if [[ -z "$DEFAULT_GW" || -z "$DEFAULT_IFACE" ]]; then
-        fatal "无法获取默认网关或网卡信息"
+        fatal "无法获取IPv4默认网关或网卡信息"
     fi
 
-    info "默认网关: ${DEFAULT_GW}  默认网卡: ${DEFAULT_IFACE}"
+    info "IPv4 默认网关: ${DEFAULT_GW}  默认网卡: ${DEFAULT_IFACE}"
 }
 
-# ─── 函数：获取TUN对端IP ────────────────────────────────────────────────────
+# ─── 函数：获取IPv6默认网关和网卡 ────────────────────────────────────────────
+get_default_route6() {
+    DEFAULT_GW6=$(ip -6 route show default 2>/dev/null | awk '/default/ {print $3}' | head -n1)
+    DEFAULT_IFACE6=$(ip -6 route show default 2>/dev/null | awk '/default/ {print $5}' | head -n1)
+
+    if [[ -n "$DEFAULT_GW6" && -n "$DEFAULT_IFACE6" ]]; then
+        info "IPv6 默认网关: ${DEFAULT_GW6}  默认网卡: ${DEFAULT_IFACE6}"
+        HAS_IPV6=1
+    else
+        warn "无法获取IPv6默认网关，将跳过IPv6路由处理"
+        HAS_IPV6=0
+    fi
+}
+
+# ─── 函数：获取TUN IPv4 对端IP ────────────────────────────────────────────────
 get_tun_peer() {
     TUN_PEER=""
     if ip link show "$TUN_DEV" &>/dev/null; then
@@ -61,9 +76,30 @@ get_tun_peer() {
     fi
 
     if [[ -n "$TUN_PEER" ]]; then
-        info "TUN对端IP: ${TUN_PEER}"
+        info "TUN IPv4 对端: ${TUN_PEER}"
     else
-        warn "TUN设备 ${TUN_DEV} 未就绪或无法获取对端IP，隧道默认路由将跳过"
+        warn "TUN设备 ${TUN_DEV} 未就绪或无法获取IPv4对端IP，隧道默认路由将跳过"
+    fi
+}
+
+# ─── 函数：获取TUN IPv6 对端IP ────────────────────────────────────────────────
+get_tun_peer6() {
+    TUN_PEER6=""
+    if ip link show "$TUN_DEV" &>/dev/null; then
+        # 获取 TUN 设备上的全局 IPv6 地址的 peer 地址
+        TUN_PEER6=$(ip -6 addr show dev "$TUN_DEV" scope global 2>/dev/null | \
+            awk '/peer / { split($4, a, "/"); print a[1] }' | head -n1)
+        if [[ -z "$TUN_PEER6" ]]; then
+            # 尝试从 IPv6 路由获取（fd00::/ULA 或全局地址）
+            TUN_PEER6=$(ip -6 route show dev "$TUN_DEV" 2>/dev/null | \
+                awk '/^[0-9a-f]/ && !/^fe80/ { split($1, a, "/"); print a[1] }' | head -n1)
+        fi
+    fi
+
+    if [[ -n "$TUN_PEER6" ]]; then
+        info "TUN IPv6 对端: ${TUN_PEER6}"
+    else
+        warn "无法获取TUN IPv6对端IP，IPv6隧道默认路由将跳过"
     fi
 }
 
@@ -85,120 +121,218 @@ download_apnic() {
     fi
 }
 
-# ─── 函数：将主机数转换为CIDR前缀长度 ───────────────────────────────────────
-hosts_to_cidr() {
-    local hosts=$1
-    local prefix=32
-    local n=1
-    while [[ $n -lt $hosts ]]; do
-        n=$((n * 2))
-        prefix=$((prefix - 1))
-    done
-    echo $prefix
-}
+# ─── 函数：解析CN IPv4段并生成批量路由命令 ────────────────────────────────────
+generate_routes_v4() {
+    info "解析中国大陆 IPv4 地址段..."
 
-# ─── 函数：解析CN IPv4段并生成批量路由命令 ───────────────────────────────────
-generate_routes() {
-    info "解析中国大陆IPv4地址段..."
+    # APNIC IPv4 格式: apnic|CN|ipv4|起始IP|主机数|日期|状态
+    # hosts → CIDR 前缀长度（主机数一定是 2 的幂）
+    awk -F'|' \
+        -v gw="$DEFAULT_GW" \
+        -v iface="$DEFAULT_IFACE" \
+        -v table="$ROUTE_TABLE_CN" \
+    '
+    $1 == "apnic" && $2 == "CN" && $3 == "ipv4" {
+        hosts = $5 + 0
+        prefix = 32
+        n = 1
+        while (n < hosts) {
+            n *= 2
+            prefix--
+        }
+        print "route add " $4 "/" prefix " via " gw " dev " iface " table " table
+    }
+    ' "$APNIC_FILE" > "$BATCH_FILE_V4"
 
-    local count=0
-
-    # 清空批量文件
-    > "$BATCH_FILE"
-
-    # 解析 APNIC 数据中的 CN IPv4 条目
-    # 格式: apnic|CN|ipv4|起始IP|主机数|日期|状态
-    while IFS='|' read -r registry cc type start value _ _; do
-        if [[ "$registry" == "apnic" && "$cc" == "CN" && "$type" == "ipv4" ]]; then
-            local cidr
-            cidr=$(hosts_to_cidr "$value")
-            echo "route add ${start}/${cidr} via ${DEFAULT_GW} dev ${DEFAULT_IFACE} table ${ROUTE_TABLE_CN}" >> "$BATCH_FILE"
-            count=$((count + 1))
-        fi
-    done < "$APNIC_FILE"
-
-    info "共解析 ${count} 条中国大陆IPv4路由"
+    local count
+    count=$(wc -l < "$BATCH_FILE_V4")
+    info "共解析 ${count} 条中国大陆 IPv4 路由"
     echo "$count"
 }
 
-# ─── 函数：刷新并应用路由 ────────────────────────────────────────────────────
-apply_routes() {
-    info "刷新路由表 ${ROUTE_TABLE_CN}..."
+# ─── 函数：解析CN IPv6段并生成批量路由命令 ────────────────────────────────────
+generate_routes_v6() {
+    if [[ "$HAS_IPV6" -ne 1 ]]; then
+        info "跳过 IPv6 路由生成（无IPv6默认路由）"
+        echo "0" > "$BATCH_FILE_V6"
+        echo "0"
+        return
+    fi
+
+    info "解析中国大陆 IPv6 地址段..."
+
+    # APNIC IPv6 格式: apnic|CN|ipv6|前缀|前缀长度|日期|状态
+    # 例如: apnic|CN|ipv6|2001:250::|35|20000101|allocated
+    # 注意: $5 已经是 CIDR 前缀长度，无需转换
+    awk -F'|' \
+        -v gw="$DEFAULT_GW6" \
+        -v iface="$DEFAULT_IFACE6" \
+        -v table="$ROUTE_TABLE_CN" \
+    '
+    $1 == "apnic" && $2 == "CN" && $3 == "ipv6" {
+        prefix_len = $5 + 0
+        # 过滤无效的前缀长度
+        if (prefix_len >= 16 && prefix_len <= 128) {
+            print "-6 route add " $4 "/" prefix_len " via " gw " dev " iface " table " table
+        }
+    }
+    ' "$APNIC_FILE" > "$BATCH_FILE_V6"
+
+    local count
+    count=$(wc -l < "$BATCH_FILE_V6")
+    info "共解析 ${count} 条中国大陆 IPv6 路由"
+    echo "$count"
+}
+
+# ─── 函数：刷新并应用IPv4路由 ────────────────────────────────────────────────
+apply_routes_v4() {
+    info "刷新 IPv4 路由表 ${ROUTE_TABLE_CN}..."
     ip route flush table "$ROUTE_TABLE_CN" 2>/dev/null || true
 
-    info "批量添加中国大陆路由..."
-    if [[ -s "$BATCH_FILE" ]]; then
-        # ip -batch 执行
-        ip -batch "$BATCH_FILE" 2>/dev/null || {
-            warn "部分路由添加失败，尝试逐条添加..."
+    info "批量添加中国大陆 IPv4 路由..."
+    if [[ -s "$BATCH_FILE_V4" ]]; then
+        ip -batch "$BATCH_FILE_V4" 2>/dev/null || {
+            warn "部分IPv4路由添加失败，尝试逐条添加..."
             local failed=0
             while read -r line; do
                 ip $line 2>/dev/null || failed=$((failed + 1))
-            done < "$BATCH_FILE"
+            done < "$BATCH_FILE_V4"
             if [[ $failed -gt 0 ]]; then
-                warn "${failed} 条路由添加失败"
+                warn "${failed} 条IPv4路由添加失败"
             fi
         }
     else
-        warn "路由批量文件为空"
+        warn "IPv4 路由批量文件为空"
     fi
 
-    info "路由表更新完成"
+    info "IPv4 路由更新完成"
+}
+
+# ─── 函数：刷新并应用IPv6路由 ────────────────────────────────────────────────
+apply_routes_v6() {
+    if [[ "$HAS_IPV6" -ne 1 ]]; then
+        info "跳过 IPv6 路由应用（无IPv6默认路由）"
+        return
+    fi
+
+    info "刷新 IPv6 路由表 ${ROUTE_TABLE_CN}..."
+    ip -6 route flush table "$ROUTE_TABLE_CN" 2>/dev/null || true
+
+    info "批量添加中国大陆 IPv6 路由..."
+    if [[ -s "$BATCH_FILE_V6" ]]; then
+        ip -batch "$BATCH_FILE_V6" 2>/dev/null || {
+            warn "部分IPv6路由添加失败，尝试逐条添加..."
+            local failed=0
+            while read -r line; do
+                ip $line 2>/dev/null || failed=$((failed + 1))
+            done < "$BATCH_FILE_V6"
+            if [[ $failed -gt 0 ]]; then
+                warn "${failed} 条IPv6路由添加失败"
+            fi
+        }
+    else
+        warn "IPv6 路由批量文件为空"
+    fi
+
+    info "IPv6 路由更新完成"
 }
 
 # ─── 函数：确保策略路由规则存在 ──────────────────────────────────────────────
 setup_policy_rules() {
     info "配置策略路由规则..."
 
+    # === IPv4 策略规则 ===
+
     # 规则1: 带有 fwmark 标记的流量查 CN 路由表（中国IP直连）
     if ! ip rule show | grep -q "fwmark ${FWMARK} lookup ${ROUTE_TABLE_CN}"; then
         ip rule add fwmark "$FWMARK" table "$ROUTE_TABLE_CN" priority 100
-        info "已添加策略规则: fwmark ${FWMARK} -> table ${ROUTE_TABLE_CN}"
+        info "已添加 IPv4 策略规则: fwmark ${FWMARK} -> table ${ROUTE_TABLE_CN}"
     else
-        info "策略规则(CN)已存在，跳过"
+        info "IPv4 策略规则(CN)已存在，跳过"
     fi
 
     # 规则2: 来自 VPN 客户端子网的流量查隧道路由表
     if ! ip rule show | grep -q "from 10.10.10.0/24 lookup ${ROUTE_TABLE_TUNNEL}"; then
         ip rule add from 10.10.10.0/24 table "$ROUTE_TABLE_TUNNEL" priority 200
-        info "已添加策略规则: from 10.10.10.0/24 -> table ${ROUTE_TABLE_TUNNEL}"
+        info "已添加 IPv4 策略规则: from 10.10.10.0/24 -> table ${ROUTE_TABLE_TUNNEL}"
     else
-        info "策略规则(Tunnel)已存在，跳过"
+        info "IPv4 策略规则(Tunnel)已存在，跳过"
     fi
 
-    # iptables mangle 规则: 对目的为中国IP的流量打标记
-    # 使用 ipset 或逐条 iptables 不现实，这里用路由表实现：
-    # 中国IP走 table 200（直连），其他走 table 201（隧道）
-    # mangle PREROUTING: 标记来自VPN客户端的流量
-    if ! iptables -t mangle -C PREROUTING -s 10.10.10.0/24 -j CONNMARK --restore-mark 2>/dev/null; then
-        iptables -t mangle -A PREROUTING -s 10.10.10.0/24 -j CONNMARK --restore-mark 2>/dev/null || true
+    # iptables mangle: 对来自VPN客户端的流量打上fwmark标记
+    if ! iptables -t mangle -C PREROUTING -s 10.10.10.0/24 -j MARK --set-mark ${FWMARK} 2>/dev/null; then
+        iptables -t mangle -A PREROUTING -s 10.10.10.0/24 -j MARK --set-mark ${FWMARK}
+    fi
+
+    # === IPv6 策略规则（如果有IPv6默认路由） ===
+    if [[ "$HAS_IPV6" -eq 1 ]]; then
+        # IPv6 fwmark 策略: 带标记的IPv6流量查 CN 路由表
+        if ! ip -6 rule show 2>/dev/null | grep -q "fwmark ${FWMARK} lookup ${ROUTE_TABLE_CN}"; then
+            ip -6 rule add fwmark "$FWMARK" table "$ROUTE_TABLE_CN" priority 100
+            info "已添加 IPv6 策略规则: fwmark ${FWMARK} -> table ${ROUTE_TABLE_CN}"
+        else
+            info "IPv6 策略规则(CN)已存在，跳过"
+        fi
+
+        # IPv6 隧道策略: 来自 VPN 客户端子网的 IPv6 流量查隧道路由表
+        # 注：PPP 客户端可能没有 IPv6 地址，这里为 TUN IPv6 子网添加策略
+        if [[ -n "$TUN_PEER6" ]]; then
+            # 获取 TUN 设备上本端的 IPv6 地址/前缀
+            local tun_local6
+            tun_local6=$(ip -6 addr show dev "$TUN_DEV" scope global 2>/dev/null | \
+                awk '/inet6/ && !/peer/ { print $2 }' | head -n1)
+            if [[ -n "$tun_local6" ]]; then
+                local tun6_net
+                tun6_net=$(echo "$tun_local6" | sed 's|/[0-9]*$||')
+                local tun6_prefix
+                tun6_prefix=$(echo "$tun_local6" | grep -o '/[0-9]*$' | tr -d '/')
+                : "${tun6_prefix:=64}"
+                # 简化：使用 from 规则匹配 TUN IPv6 子网
+                # 通常 PPP 客户端不会有 IPv6，此规则主要为将来扩展保留
+            fi
+        fi
+
+        # IPv6 隧道默认路由策略（与 IPv4 类似）
+        # 对于 PPP 客户端的 IPv6 流量，目前通过 fwmark 分流即可
+        info "IPv6 策略路由规则配置完成"
     fi
 
     info "策略路由规则配置完成"
 }
 
-# ─── 函数：确保隧道默认路由存在 ──────────────────────────────────────────────
+# ─── 函数：确保隧道默认路由存在（IPv4 + IPv6） ────────────────────────────────
 setup_tunnel_default_route() {
     info "配置隧道默认路由..."
 
-    if [[ -z "$TUN_PEER" ]]; then
-        warn "TUN对端IP未知，跳过隧道默认路由配置"
-        return
-    fi
-
-    # 在隧道路由表中添加默认路由（通过TUN设备转发）
-    if ! ip route show table "$ROUTE_TABLE_TUNNEL" | grep -q "default"; then
-        ip route add default via "$TUN_PEER" dev "$TUN_DEV" table "$ROUTE_TABLE_TUNNEL" 2>/dev/null || {
-            warn "添加隧道默认路由失败（TUN设备可能未就绪）"
-            return
-        }
-        info "已添加隧道默认路由: default via ${TUN_PEER} dev ${TUN_DEV} table ${ROUTE_TABLE_TUNNEL}"
+    # === IPv4 隧道默认路由 ===
+    if [[ -n "$TUN_PEER" ]]; then
+        if ! ip route show table "$ROUTE_TABLE_TUNNEL" | grep -q "default"; then
+            ip route add default via "$TUN_PEER" dev "$TUN_DEV" table "$ROUTE_TABLE_TUNNEL" 2>/dev/null || {
+                warn "添加 IPv4 隧道默认路由失败（TUN设备可能未就绪）"
+            }
+            info "已添加 IPv4 隧道默认路由: default via ${TUN_PEER} dev ${TUN_DEV} table ${ROUTE_TABLE_TUNNEL}"
+        else
+            info "IPv4 隧道默认路由已存在，跳过"
+        fi
     else
-        info "隧道默认路由已存在，跳过"
+        warn "TUN IPv4 对端未知，跳过 IPv4 隧道默认路由"
     fi
 
-    # 确保隧道路由表中也有中国IP直连路由（避免回环）
-    # 中国IP在 table 200 中已配置，通过策略路由优先级保证
+    # === IPv6 隧道默认路由 ===
+    if [[ "$HAS_IPV6" -eq 1 && -n "$TUN_PEER6" ]]; then
+        if ! ip -6 route show table "$ROUTE_TABLE_TUNNEL" 2>/dev/null | grep -q "default"; then
+            ip -6 route add default via "$TUN_PEER6" dev "$TUN_DEV" table "$ROUTE_TABLE_TUNNEL" 2>/dev/null || {
+                warn "添加 IPv6 隧道默认路由失败（TUN设备或IPv6未就绪）"
+            }
+            info "已添加 IPv6 隧道默认路由: default via ${TUN_PEER6} dev ${TUN_DEV} table ${ROUTE_TABLE_TUNNEL}"
+        else
+            info "IPv6 隧道默认路由已存在，跳过"
+        fi
+    else
+        if [[ "$HAS_IPV6" -eq 1 ]]; then
+            warn "TUN IPv6 对端未知，跳过 IPv6 隧道默认路由"
+        fi
+    fi
 }
 
 # ─── 函数：确保路由表名称注册 ────────────────────────────────────────────────
@@ -218,13 +352,16 @@ register_route_tables() {
 
 # ─── 函数：记录日志 ──────────────────────────────────────────────────────────
 log_result() {
-    local count=$1
+    local count_v4=$1
+    local count_v6=$2
     local timestamp
     timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    local cn_routes
-    cn_routes=$(ip route show table "$ROUTE_TABLE_CN" 2>/dev/null | wc -l)
+    local cn_routes_v4
+    cn_routes_v4=$(ip route show table "$ROUTE_TABLE_CN" 2>/dev/null | wc -l)
+    local cn_routes_v6
+    cn_routes_v6=$(ip -6 route show table "$ROUTE_TABLE_CN" 2>/dev/null | wc -l)
 
-    local log_entry="[${timestamp}] 路由更新完成: 解析 ${count} 条CN路由，实际生效 ${cn_routes} 条"
+    local log_entry="[${timestamp}] 路由更新完成: IPv4 解析 ${count_v4} 条/生效 ${cn_routes_v4} 条, IPv6 解析 ${count_v6} 条/生效 ${cn_routes_v6} 条"
     echo "$log_entry" >> "$LOG_FILE"
     info "$log_entry"
 }
@@ -232,24 +369,33 @@ log_result() {
 # ─── 主流程 ──────────────────────────────────────────────────────────────────
 main() {
     echo ""
-    echo -e "${GREEN}╔════════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║  MiniVPN APNIC中国大陆路由更新脚本        ║${NC}"
-    echo -e "${GREEN}╚════════════════════════════════════════════╝${NC}"
+    echo -e "${GREEN}╔═══════════════════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}║  MiniVPN APNIC中国大陆路由更新（IPv4 + IPv6）    ║${NC}"
+    echo -e "${GREEN}╚═══════════════════════════════════════════════════╝${NC}"
     echo ""
 
     check_root
+
+    # 文件锁：防止多个实例同时运行
+    exec 200>/var/lock/minivpn-routes.lock
+    flock -n 200 || { warn "另一个实例正在运行，退出"; exit 0; }
+
     get_default_route
+    get_default_route6
     get_tun_peer
+    get_tun_peer6
     register_route_tables
     download_apnic
 
-    local count
-    count=$(generate_routes)
+    local count_v4 count_v6
+    count_v4=$(generate_routes_v4)
+    count_v6=$(generate_routes_v6)
 
-    apply_routes
+    apply_routes_v4
+    apply_routes_v6
     setup_policy_rules
     setup_tunnel_default_route
-    log_result "$count"
+    log_result "$count_v4" "$count_v6"
 
     echo ""
     info "路由更新完成！无需重启任何服务。"

@@ -4,6 +4,7 @@ set -e
 ###############################################################################
 # deploy-exit.sh - MiniVPN 远端（海外出口）一键部署脚本
 # 用法: ./deploy-exit.sh -k <secret> [-p <port>] [--tun-ip <ip>] [--tun-peer <ip>]
+#       [--tun-ip6 <ip6>] [--tun-peer6 <ip6>] [--ipv6]
 # 面向: Ubuntu 22.04+ / Debian 12+
 ###############################################################################
 
@@ -22,6 +23,10 @@ fatal()   { error "$*"; exit 1; }
 PORT=4567
 TUN_IP="172.16.0.1"
 TUN_PEER="172.16.0.2"
+TUN_IP6=""               # IPv6 TUN 本端地址（可选）
+TUN_PEER6=""             # IPv6 TUN 对端地址（可选）
+TUN_IP6_PREFIX=64        # IPv6 前缀长度
+USE_IPV6=0               # 是否使用 IPv6 监听
 SECRET=""
 SRC_DIR="/opt/minivpn"
 CONF_DIR="/etc/minivpn"
@@ -55,6 +60,18 @@ parse_args() {
                 TUN_PEER="$2"
                 shift 2
                 ;;
+            --tun-ip6)
+                TUN_IP6="$2"
+                shift 2
+                ;;
+            --tun-peer6)
+                TUN_PEER6="$2"
+                shift 2
+                ;;
+            -6|--ipv6)
+                USE_IPV6=1
+                shift
+                ;;
             -h|--help)
                 usage
                 exit 0
@@ -73,18 +90,22 @@ parse_args() {
 # ─── 函数：显示用法 ──────────────────────────────────────────────────────────
 usage() {
     cat <<EOF
-用法: $0 -k <secret> [-p <port>] [--tun-ip <ip>] [--tun-peer <ip>]
+用法: $0 -k <secret> [-p <port>] [--tun-ip <ip>] [--tun-peer <ip>] [选项]
 
 参数:
   -k, --key <secret>       隧道预共享密钥（必须）
   -p, --port <port>        监听UDP端口（默认: 4567）
-  --tun-ip <ip>            本端TUN接口IP（默认: 172.16.0.1）
-  --tun-peer <ip>          对端TUN接口IP（默认: 172.16.0.2）
+  --tun-ip <ip>            本端TUN接口IPv4（默认: 172.16.0.1）
+  --tun-peer <ip>          对端TUN接口IPv4（默认: 172.16.0.2）
+  --tun-ip6 <ip6>          本端TUN接口IPv6（可选，如 fd00::1）
+  --tun-peer6 <ip6>        对端TUN接口IPv6（可选，如 fd00::2）
+  -6, --ipv6               使用IPv6监听（默认IPv4）
   -h, --help               显示此帮助信息
 
 示例:
   $0 -k mysecretkey
-  $0 -k mysecretkey -p 5678 --tun-ip 10.0.0.1 --tun-peer 10.0.0.2
+  $0 -k mysecretkey -p 5678 --tun-ip6 fd00::1 --tun-peer6 fd00::2
+  $0 -k mysecretkey -6 -p 4567    # IPv6 监听
 EOF
 }
 
@@ -130,17 +151,37 @@ create_config() {
     info "创建配置文件 ${CONF_FILE}..."
     mkdir -p "$CONF_DIR"
 
+    local listen_addr="0.0.0.0:${PORT}"
+    if [[ "$USE_IPV6" -eq 1 ]]; then
+        listen_addr="[::]:${PORT}"
+    fi
+
     cat > "$CONF_FILE" <<EOF
 # MiniVPN 远端（Exit Node）配置文件
 # 由 deploy-exit.sh 自动生成于 $(date '+%Y-%m-%d %H:%M:%S')
 
 mode = server
-listen = 0.0.0.0:${PORT}
+listen = ${listen_addr}
 secret = ${SECRET}
 tun_ip = ${TUN_IP}
 tun_peer = ${TUN_PEER}
-log_level = 1
 EOF
+
+    # 添加 IPv6 TUN 配置（如果指定）
+    if [[ -n "$TUN_IP6" ]]; then
+        cat >> "$CONF_FILE" <<EOF
+tun_ip6 = ${TUN_IP6}
+tun_ip6_prefix = ${TUN_IP6_PREFIX}
+EOF
+    fi
+    if [[ -n "$TUN_PEER6" ]]; then
+        echo "tun_peer6 = ${TUN_PEER6}" >> "$CONF_FILE"
+    fi
+    if [[ "$USE_IPV6" -eq 1 ]]; then
+        echo "ipv6 = yes" >> "$CONF_FILE"
+    fi
+
+    echo "log_level = 1" >> "$CONF_FILE"
 
     chmod 600 "$CONF_FILE"
     info "配置文件创建完成"
@@ -148,21 +189,28 @@ EOF
 
 # ─── 函数：开启IP转发 ────────────────────────────────────────────────────────
 enable_ip_forward() {
-    info "开启IPv4转发..."
+    info "开启IP转发..."
 
-    # 立即生效
+    # IPv4 转发
     sysctl -w net.ipv4.ip_forward=1
 
-    # 持久化
+    # 持久化配置
     local sysctl_conf="/etc/sysctl.d/99-minivpn.conf"
-    if [[ -f "$sysctl_conf" ]] && grep -q "net.ipv4.ip_forward=1" "$sysctl_conf"; then
-        info "IP转发配置已存在，跳过"
-    else
-        echo "net.ipv4.ip_forward=1" > "$sysctl_conf"
-        sysctl --system > /dev/null 2>&1
-    fi
+    cat > "$sysctl_conf" <<'EOF'
+net.ipv4.ip_forward=1
+net.ipv6.conf.all.forwarding=1
+net.ipv6.conf.default.forwarding=1
+EOF
+    sysctl --system > /dev/null 2>&1
 
-    info "IP转发已开启"
+    # IPv6 转发（如果使用 IPv6 TUN）
+    if [[ -n "$TUN_IP6" ]]; then
+        sysctl -w net.ipv6.conf.all.forwarding=1
+        sysctl -w net.ipv6.conf.default.forwarding=1
+        info "IPv4 和 IPv6 转发已开启"
+    else
+        info "IPv4 转发已开启"
+    fi
 }
 
 # ─── 函数：获取默认出口网卡 ─────────────────────────────────────────────────
@@ -175,7 +223,7 @@ get_default_iface() {
     echo "$iface"
 }
 
-# ─── 函数：配置iptables NAT ─────────────────────────────────────────────────
+# ─── 函数：配置iptables NAT（IPv4） ─────────────────────────────────────────
 setup_iptables() {
     info "配置iptables NAT规则..."
 
@@ -186,7 +234,9 @@ setup_iptables() {
     tun_subnet=$(echo "$TUN_IP" | awk -F. '{print $1"."$2"."$3".0/24"}')
 
     info "默认出口网卡: ${iface}"
-    info "TUN子网: ${tun_subnet}"
+    info "TUN IPv4 子网: ${tun_subnet}"
+
+    # === IPv4 规则 ===
 
     # POSTROUTING NAT（幂等：先检查是否已存在）
     if ! iptables -t nat -C POSTROUTING -s "$tun_subnet" -o "$iface" -j MASQUERADE 2>/dev/null; then
@@ -206,7 +256,54 @@ setup_iptables() {
         iptables -A INPUT -p udp --dport "$PORT" -j ACCEPT
     fi
 
+    # === IPv6 规则（如果指定了 TUN IPv6 地址） ===
+    if [[ -n "$TUN_IP6" ]]; then
+        # 从 TUN_IP6 推导 /64 子网
+        local tun6_subnet="${TUN_IP6}/${TUN_IP6_PREFIX}"
+
+        info "TUN IPv6 子网: ${tun6_subnet}"
+
+        # IPv6 NAT（MASQUERADE）
+        if ! ip6tables -t nat -C POSTROUTING -s "$tun6_subnet" -o "$iface" -j MASQUERADE 2>/dev/null; then
+            ip6tables -t nat -A POSTROUTING -s "$tun6_subnet" -o "$iface" -j MASQUERADE
+        fi
+
+        # IPv6 FORWARD 规则
+        if ! ip6tables -C FORWARD -s "$tun6_subnet" -j ACCEPT 2>/dev/null; then
+            ip6tables -A FORWARD -s "$tun6_subnet" -j ACCEPT
+        fi
+        if ! ip6tables -C FORWARD -d "$tun6_subnet" -j ACCEPT 2>/dev/null; then
+            ip6tables -A FORWARD -d "$tun6_subnet" -j ACCEPT
+        fi
+
+        # IPv6 INPUT 放行 UDP 端口
+        if ! ip6tables -C INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null; then
+            ip6tables -A INPUT -p udp --dport "$PORT" -j ACCEPT
+        fi
+
+        info "ip6tables 规则配置完成"
+    fi
+
     info "iptables 规则配置完成"
+}
+
+# ─── 函数：配置 TCP MSS Clamping（避免 MTU 问题导致的分片） ─────────────────
+setup_mss_clamping() {
+    info "配置 TCP MSS Clamping..."
+
+    # IPv4 MSS clamping
+    if ! iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
+        iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    fi
+
+    # IPv6 MSS clamping（如果启用了 IPv6）
+    if [[ -n "$TUN_IP6" ]]; then
+        if ! ip6tables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
+            ip6tables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+        fi
+    fi
+
+    info "TCP MSS Clamping 配置完成"
 }
 
 # ─── 函数：保存iptables规则 ──────────────────────────────────────────────────
@@ -219,9 +316,10 @@ persist_iptables() {
 
     apt install -y iptables-persistent
 
-    # 保存当前规则
+    # 保存当前规则（IPv4 和 IPv6）
     iptables-save > /etc/iptables/rules.v4
-    info "iptables 规则已持久化"
+    ip6tables-save > /etc/iptables/rules.v6
+    info "iptables 规则已持久化（IPv4 + IPv6）"
 }
 
 # ─── 函数：创建systemd服务 ───────────────────────────────────────────────────
@@ -240,6 +338,14 @@ ExecStart=/usr/local/bin/minivpn -f ${CONF_FILE}
 Restart=always
 RestartSec=5
 LimitNOFILE=65536
+
+# 安全加固
+ProtectHome=yes
+ReadWritePaths=/dev/net/tun
+PrivateTmp=yes
+
+# TUN 设备配置需要 CAP_NET_ADMIN（ioctl SIOCSIFADDR/SIOCSIFMTU 等）
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
 
 [Install]
 WantedBy=multi-user.target
@@ -278,8 +384,15 @@ show_summary() {
     echo ""
     echo -e "  服务器IP:     ${public_ip:-未知}"
     echo -e "  监听端口:     ${PORT}/udp"
-    echo -e "  TUN本端IP:   ${TUN_IP}"
-    echo -e "  TUN对端IP:   ${TUN_PEER}"
+    echo -e "  监听模式:     $(if [[ "$USE_IPV6" -eq 1 ]]; then echo "IPv6 ([::])"; else echo "IPv4 (0.0.0.0)"; fi)"
+    echo -e "  TUN本端IPv4: ${TUN_IP}"
+    echo -e "  TUN对端IPv4: ${TUN_PEER}"
+    if [[ -n "$TUN_IP6" ]]; then
+        echo -e "  TUN本端IPv6: ${TUN_IP6}/${TUN_IP6_PREFIX}"
+    fi
+    if [[ -n "$TUN_PEER6" ]]; then
+        echo -e "  TUN对端IPv6: ${TUN_PEER6}"
+    fi
     echo -e "  配置文件:     ${CONF_FILE}"
     echo -e "  服务状态:     $(systemctl is-active minivpn)"
     echo ""
@@ -308,6 +421,7 @@ main() {
     create_config
     enable_ip_forward
     setup_iptables
+    setup_mss_clamping
     persist_iptables
     create_service
     start_service

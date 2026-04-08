@@ -1,9 +1,11 @@
 /*
- * MiniVPN - 日志宏
+ * MiniVPN - 线程安全日志宏
  *
  * 支持3个级别: ERROR(0), INFO(1), DEBUG(2)
  * 通过全局变量 g_log_level 控制输出级别
  * 格式: [时间][级别] 消息
+ *
+ * 使用 flockfile/funlockfile 确保多线程日志输出不交错
  */
 
 #ifndef MINIVPN_LOG_H
@@ -23,6 +25,10 @@ extern int g_log_level;
 /* 获取当前时间字符串的辅助宏 */
 #define LOG_TIME_BUF_SIZE 20
 
+/*
+ * 线程安全日志输出宏
+ * flockfile/funlockfile 确保单条日志的时间戳和内容不被其他线程打断
+ */
 #define LOG_PRINT(level_str, fmt, ...)                                   \
     do {                                                                 \
         time_t _log_t = time(NULL);                                      \
@@ -31,8 +37,11 @@ extern int g_log_level;
         localtime_r(&_log_t, &_log_tm);                                  \
         strftime(_log_buf, sizeof(_log_buf), "%Y-%m-%d %H:%M:%S",       \
                  &_log_tm);                                              \
+        flockfile(stderr);                                               \
         fprintf(stderr, "[%s][%s] " fmt "\n", _log_buf, level_str,      \
                 ##__VA_ARGS__);                                          \
+        fflush_unlocked(stderr);                                         \
+        funlockfile(stderr);                                             \
     } while (0)
 
 /* 各级别日志宏 */

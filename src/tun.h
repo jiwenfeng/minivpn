@@ -2,6 +2,7 @@
  * MiniVPN - Linux TUN 设备管理
  *
  * 使用 /dev/net/tun + ioctl 实现 TUN 设备的创建与配置
+ * 支持 IPv4 和 IPv6 地址配置
  */
 
 #ifndef MINIVPN_TUN_H
@@ -17,14 +18,25 @@
 int tun_create(char *dev_name, int dev_name_size);
 
 /*
- * 配置 TUN 设备 IP 地址
+ * 配置 TUN 设备 IPv4 地址
  *
  * @param dev_name   设备名 (如 "tun0")
- * @param local_ip   本端 IP 地址 (如 "172.16.0.1")
- * @param peer_ip    对端 IP 地址 (如 "172.16.0.2")
+ * @param local_ip   本端 IPv4 地址 (如 "172.16.0.1")
+ * @param peer_ip    对端 IPv4 地址 (如 "172.16.0.2")
  * @return           0成功, -1失败
  */
 int tun_configure(const char *dev_name, const char *local_ip, const char *peer_ip);
+
+/*
+ * 配置 TUN 设备 IPv6 地址
+ *
+ * @param dev_name    设备名 (如 "tun0")
+ * @param local_ip6   本端 IPv6 地址 (如 "fd00::1")
+ * @param prefix_len  IPv6 前缀长度 (如 64)
+ * @return            0成功, -1失败
+ */
+int tun_configure_ipv6(const char *dev_name, const char *local_ip6,
+                       int prefix_len);
 
 /*
  * 设置 TUN 设备 MTU

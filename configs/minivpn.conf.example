@@ -15,17 +15,34 @@
 mode = server
 
 # 监听地址（server 模式必须指定）
-# 格式: ADDR:PORT
+# IPv4 格式: ADDR:PORT
 listen = 0.0.0.0:4567
+# IPv6 格式: [ADDR]:PORT
+# listen = [::]:4567
 
 # 预共享密钥（server/client 两端必须一致）
 secret = change-me-to-a-strong-secret
 
-# TUN 设备本端 IP
+# 密钥文件路径（优先于 secret，更安全）
+# secret_file = /etc/minivpn/secret.key
+
+# TUN 设备本端 IPv4
 tun_ip = 172.16.0.1
 
-# TUN 设备对端 IP
+# TUN 设备对端 IPv4
 tun_peer = 172.16.0.2
+
+# TUN 设备本端 IPv6（可选，启用 IPv6 双栈）
+# tun_ip6 = fd00::1
+
+# TUN 设备对端 IPv6（可选，双栈时使用）
+# tun_peer6 = fd00::2
+
+# IPv6 前缀长度（默认 64）
+# tun_ip6_prefix = 64
+
+# 强制使用 IPv6 监听/连接（yes/no，默认 no=自动检测）
+# ipv6 = no
 
 # Worker 线程数（默认为 CPU 核数）
 # threads = 4
@@ -44,14 +61,20 @@ log_level = 1
 # mode = client
 
 # 远端地址（client 模式必须指定）
-# 格式: ADDR:PORT
+# IPv4 格式: ADDR:PORT
 # remote = 1.2.3.4:4567
+# IPv6 格式: [ADDR]:PORT
+# remote = [2001:db8::1]:4567
 
 # secret = change-me-to-a-strong-secret
 
 # 客户端 TUN IP（与服务端相反）
 # tun_ip = 172.16.0.2
 # tun_peer = 172.16.0.1
+
+# 客户端 TUN IPv6（可选，与服务端对应）
+# tun_ip6 = fd00::2
+# tun_peer6 = fd00::1
 
 # threads = 4
 # mtu = 1400
