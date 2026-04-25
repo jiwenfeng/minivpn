@@ -21,6 +21,11 @@ fatal()   { error "$*"; exit 1; }
 
 # ─── 配置变量 ────────────────────────────────────────────────────────────────
 APNIC_URL="https://ftp.apnic.net/apnic/stats/apnic/delegated-apnic-latest"
+APNIC_MIRROR_URLS=(
+    "https://ftp.apnic.net/apnic/stats/apnic/delegated-apnic-latest"
+    "https://mirror.xtom.com.hk/apnic/stats/apnic/delegated-apnic-latest"
+    "https://mirror1.apnic.net/stats/apnic/delegated-apnic-latest"
+)
 ROUTE_TABLE_CN=200         # 中国大陆IP走默认网关的路由表
 ROUTE_TABLE_TUNNEL=201     # 其他流量走隧道的路由表
 FWMARK=100                 # iptables fwmark 标记值
@@ -108,15 +113,32 @@ download_apnic() {
     info "下载APNIC数据..."
     mkdir -p "$DATA_DIR"
 
-    if curl -s -o "${APNIC_FILE}.tmp" --connect-timeout 30 --max-time 120 "$APNIC_URL"; then
-        mv "${APNIC_FILE}.tmp" "$APNIC_FILE"
-        info "APNIC数据下载完成: $(wc -l < "$APNIC_FILE") 行"
-    else
-        rm -f "${APNIC_FILE}.tmp"
-        if [[ -f "$APNIC_FILE" ]]; then
-            warn "下载失败，使用上次缓存的数据"
+    local downloaded=0
+    for url in "${APNIC_MIRROR_URLS[@]}"; do
+        info "尝试下载: ${url}"
+        if curl -s -o "${APNIC_FILE}.tmp" --connect-timeout 15 --max-time 120 "$url"; then
+            # 验证文件有效性（至少包含 CN 行）
+            if grep -q '|CN|' "${APNIC_FILE}.tmp" 2>/dev/null; then
+                mv "${APNIC_FILE}.tmp" "$APNIC_FILE"
+                info "APNIC数据下载完成: $(wc -l < "$APNIC_FILE") 行"
+                downloaded=1
+                break
+            else
+                warn "下载的文件内容无效，尝试下一个镜像..."
+                rm -f "${APNIC_FILE}.tmp"
+            fi
         else
-            fatal "下载APNIC数据失败，且无缓存可用"
+            warn "从 ${url} 下载失败，尝试下一个镜像..."
+            rm -f "${APNIC_FILE}.tmp"
+        fi
+    done
+
+    if [[ "$downloaded" -eq 0 ]]; then
+        if [[ -f "$APNIC_FILE" ]]; then
+            warn "所有镜像下载失败，使用上次缓存的数据"
+        else
+            warn "所有镜像下载失败，且无缓存可用。将仅配置策略路由（无CN IP分流，所有流量走隧道）"
+            APNIC_DOWNLOAD_FAILED=1
         fi
     fi
 }
@@ -380,21 +402,32 @@ main() {
     exec 200>/var/lock/minivpn-routes.lock
     flock -n 200 || { warn "另一个实例正在运行，退出"; exit 0; }
 
+    APNIC_DOWNLOAD_FAILED=0
+
     get_default_route
     get_default_route6
     get_tun_peer
     get_tun_peer6
     register_route_tables
-    download_apnic
 
-    local count_v4 count_v6
-    count_v4=$(generate_routes_v4)
-    count_v6=$(generate_routes_v6)
-
-    apply_routes_v4
-    apply_routes_v6
+    # 无论 APNIC 数据是否可用，都要先设置策略规则和隧道默认路由
+    # 这确保即使没有 CN IP 分流数据，外网流量也能通过隧道转发
     setup_policy_rules
     setup_tunnel_default_route
+
+    download_apnic
+
+    local count_v4=0 count_v6=0
+    if [[ "$APNIC_DOWNLOAD_FAILED" -eq 0 ]]; then
+        count_v4=$(generate_routes_v4)
+        count_v6=$(generate_routes_v6)
+
+        apply_routes_v4
+        apply_routes_v6
+    else
+        warn "跳过 CN 路由更新（APNIC 数据不可用），所有标记流量将走隧道"
+    fi
+
     log_result "$count_v4" "$count_v6"
 
     echo ""

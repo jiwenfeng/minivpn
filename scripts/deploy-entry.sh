@@ -283,15 +283,15 @@ configure_ppp() {
 
     mkdir -p /etc/ppp
 
-    # DNS 分流说明：
-    # - 主 DNS 使用国内公共 DNS（阿里 223.5.5.5、腾讯 119.29.29.29），
-    #   确保国内域名解析到国内 CDN 节点，避免绕路到海外 DNS
-    # - 国外域名的解析由隧道对端 DNS 或客户端自行处理
+    # DNS 策略说明：
+    # - 主 DNS 使用 Google DNS（8.8.8.8），通过隧道可达，用于外网域名正确解析
+    #   避免国内 DNS 对外网域名的污染/错误解析
+    # - 备 DNS 使用国内公共 DNS（223.5.5.5），用于国内域名解析到国内 CDN
     # MTU 1280: 满足 IPv6 最低 MTU 要求，同时兼顾 L2TP/IPsec 头部开销
     cat > /etc/ppp/options.xl2tpd <<'PPP_OPTS'
 require-mschap-v2
+ms-dns 8.8.8.8
 ms-dns 223.5.5.5
-ms-dns 119.29.29.29
 asyncmap 0
 auth
 hide-password
@@ -506,6 +506,39 @@ init_smart_routes() {
 create_service() {
     info "创建 systemd 服务..."
 
+    # 创建启动后路由初始化脚本
+    cat > "${CONF_DIR}/setup-routes.sh" <<'ROUTE_SCRIPT'
+#!/bin/bash
+# minivpn 启动后自动设置隧道路由
+# 等待 TUN 设备就绪
+sleep 3
+TUN_DEV="tun0"
+ROUTE_TABLE_TUNNEL=201
+ROUTE_TABLE_CN=200
+FWMARK=100
+
+# 获取 TUN 对端 IP
+TUN_PEER=$(ip addr show "$TUN_DEV" 2>/dev/null | awk '/peer / { split($4, a, "/"); print a[1] }' | head -n1)
+if [ -z "$TUN_PEER" ]; then
+    TUN_PEER=$(ip route show dev "$TUN_DEV" 2>/dev/null | awk '/^[0-9]/ { split($1, a, "/"); print a[1] }' | head -n1)
+fi
+
+if [ -n "$TUN_PEER" ]; then
+    # 添加隧道默认路由
+    ip route replace default via "$TUN_PEER" dev "$TUN_DEV" table "$ROUTE_TABLE_TUNNEL" 2>/dev/null || true
+    echo "[$(date)] 隧道默认路由已设置: default via $TUN_PEER dev $TUN_DEV table $ROUTE_TABLE_TUNNEL"
+
+    # 确保策略规则存在
+    ip rule show | grep -q "fwmark $FWMARK lookup $ROUTE_TABLE_CN" || \
+        ip rule add fwmark "$FWMARK" table "$ROUTE_TABLE_CN" priority 100 2>/dev/null || true
+    ip rule show | grep -q "from 10.10.10.0/24 lookup $ROUTE_TABLE_TUNNEL" || \
+        ip rule add from 10.10.10.0/24 table "$ROUTE_TABLE_TUNNEL" priority 200 2>/dev/null || true
+else
+    echo "[$(date)] 警告: 无法获取 TUN 对端 IP"
+fi
+ROUTE_SCRIPT
+    chmod +x "${CONF_DIR}/setup-routes.sh"
+
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=MiniVPN Tunnel Service (Entry Node - Client)
@@ -515,6 +548,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/minivpn -f ${CONF_FILE}
+ExecStartPost=/bin/bash ${CONF_DIR}/setup-routes.sh
 Restart=always
 RestartSec=5
 LimitNOFILE=65536
