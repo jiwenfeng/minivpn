@@ -5,7 +5,7 @@
  *
  * 改进:
  * - 所有 Worker 都监听 TUN 设备（使用 EPOLLEXCLUSIVE 减少惊群）
- * - 共享认证状态 + 无锁抗重放窗口（atomic CAS）
+ * - 共享认证状态 + 无锁抗重放窗口（atomic CAS）+ seqlock 保护地址
  * - 独立的 crypto_ctx（每个 Worker 无锁加解密）
  * - 支持 IPv4/IPv6 双栈（sockaddr_storage）
  */
@@ -33,10 +33,8 @@ int shared_peer_init(struct shared_peer_state *state)
     state->authenticated = 0;
     state->reconnect_gen = 0;
     state->last_active_time = (long)time(NULL);
+    __atomic_store_n(&state->addr_seq, 0, __ATOMIC_RELEASE);
     memset(&state->peer_addr, 0, sizeof(state->peer_addr));
-    if (pthread_mutex_init(&state->addr_mutex, NULL) != 0) {
-        return -1;
-    }
     replay_window_init(&state->replay);
     return 0;
 }
@@ -44,25 +42,30 @@ int shared_peer_init(struct shared_peer_state *state)
 void shared_peer_destroy(struct shared_peer_state *state)
 {
     if (!state) return;
-    pthread_mutex_destroy(&state->addr_mutex);
+    /* seqlock 无需销毁 */
 }
 
 void shared_peer_update_addr(struct shared_peer_state *state,
                              const struct sockaddr_storage *addr)
 {
     if (!state || !addr) return;
-    pthread_mutex_lock(&state->addr_mutex);
+    unsigned int seq = __atomic_load_n(&state->addr_seq, __ATOMIC_RELAXED);
+    __atomic_store_n(&state->addr_seq, seq + 1, __ATOMIC_RELEASE); /* 奇数=写入中 */
     memcpy(&state->peer_addr, addr, sizeof(state->peer_addr));
-    pthread_mutex_unlock(&state->addr_mutex);
+    __atomic_store_n(&state->addr_seq, seq + 2, __ATOMIC_RELEASE); /* 偶数=完成 */
 }
 
 void shared_peer_get_addr(struct shared_peer_state *state,
                           struct sockaddr_storage *addr)
 {
     if (!state || !addr) return;
-    pthread_mutex_lock(&state->addr_mutex);
-    memcpy(addr, &state->peer_addr, sizeof(*addr));
-    pthread_mutex_unlock(&state->addr_mutex);
+    unsigned int seq1, seq2;
+    do {
+        seq1 = __atomic_load_n(&state->addr_seq, __ATOMIC_ACQUIRE);
+        if (seq1 & 1) continue;  /* 写入中，重试 */
+        memcpy(addr, &state->peer_addr, sizeof(*addr));
+        seq2 = __atomic_load_n(&state->addr_seq, __ATOMIC_ACQUIRE);
+    } while (seq1 != seq2);
 }
 
 int shared_peer_replay_check(struct shared_peer_state *state,

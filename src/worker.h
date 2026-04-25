@@ -6,7 +6,7 @@
  *
  * 改进:
  * - 共享认证状态（所有Worker可见）
- * - 共享抗重放窗口（mutex保护，避免多Worker独立窗口导致的重放漏洞）
+ * - 共享抗重放窗口（避免多Worker独立窗口导致的重放漏洞）
  * - 每个Worker拥有独立的 crypto_ctx (避免锁竞争)
  * - 所有Worker都监听TUN设备（使用EPOLLEXCLUSIVE减少惊群）
  * - 支持 IPv4/IPv6 双栈（sockaddr_storage）
@@ -25,15 +25,15 @@
 /*
  * 共享认证状态 (所有 Worker 共享)
  * 通过原子操作访问 authenticated 标志
- * peer_addr 通过 mutex 保护
+ * peer_addr 通过 seqlock 保护（无锁）
  * 支持 IPv4 和 IPv6（使用 sockaddr_storage）
  */
 struct shared_peer_state {
     int authenticated;                /* 0=未认证, 1=已认证 (__atomic 访问) */
     uint64_t reconnect_gen;           /* 重连代数 (__atomic 访问) */
     volatile long last_active_time;   /* 上次收到有效帧的时间戳 (__atomic 访问，所有 Worker 共享） */
+    unsigned int addr_seq;            /* seqlock 序列号 (__atomic 访问，奇数=写入中) */
     struct sockaddr_storage peer_addr;/* 对端地址（IPv4 或 IPv6） */
-    pthread_mutex_t addr_mutex;       /* 保护 peer_addr 更新 */
     struct replay_window replay;      /* 无锁抗重放窗口 (atomic CAS) */
 };
 
