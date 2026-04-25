@@ -386,8 +386,8 @@ static void *client_worker_thread(void *arg)
             }
         }
 
-        /* 心跳检查 (只有 Worker 0 发送心跳) */
-        if (w->id == 0) {
+        /* 所有 Worker 发送 PING 心跳，确保各 Worker 的 NAT 映射保持活跃 */
+        {
             time_t now = time(NULL);
 
             /* 发送 PING */
@@ -402,21 +402,10 @@ static void *client_worker_thread(void *arg)
                         log_error("client worker[%d]: 发送 PING 失败: %s",
                                   w->id, strerror(errno));
                     } else {
-                        log_debug("client worker[%d]: 发送 PING", w->id);
+                        log_info("client worker[%d]: 发送 PING", w->id);
                     }
                 }
                 ctx->last_ping_time = now;
-            }
-
-            /* 活跃超时检测（读取共享的 last_active_time，任何 Worker 收到有效帧都会更新） */
-            long shared_active = __atomic_load_n(&w->shared_peer->last_active_time,
-                                                 __ATOMIC_SEQ_CST);
-            if (now - (time_t)shared_active > PONG_TIMEOUT) {
-                log_error("client worker[%d]: 活跃超时 (%d 秒无任何有效帧)，触发重连",
-                          w->id, PONG_TIMEOUT);
-                __atomic_store_n(&w->shared_peer->authenticated, 0,
-                                __ATOMIC_SEQ_CST);
-                continue;
             }
         }
 
@@ -527,7 +516,7 @@ static void *client_worker_thread(void *arg)
                         break;
 
                     case FRAME_PONG:
-                        log_debug("client worker[%d]: 收到 PONG", w->id);
+                        log_info("client worker[%d]: 收到 PONG", w->id);
                         break;
 
                     case FRAME_OK:
@@ -537,6 +526,7 @@ static void *client_worker_thread(void *arg)
 
                     case FRAME_PING: {
                         /* 服务端发来的 PING，回复 PONG */
+                        log_info("client worker[%d]: 收到服务端 PING，回复 PONG", w->id);
                         int pong_len = protocol_encrypt(w->crypto,
                                                         FRAME_PONG,
                                                         NULL, 0,
@@ -556,6 +546,20 @@ static void *client_worker_thread(void *arg)
                 } /* end drain loop */
             }
         } /* end for nfds */
+
+        /* 活跃超时检测（只有 Worker 0 负责重连决策，放在 epoll_wait 之后确保先处理收到的帧） */
+        if (w->id == 0) {
+            time_t now = time(NULL);
+            long shared_active = __atomic_load_n(&w->shared_peer->last_active_time,
+                                                 __ATOMIC_SEQ_CST);
+            if (now - (time_t)shared_active > PONG_TIMEOUT) {
+                log_error("client worker[%d]: PONG 超时 (%d 秒)，触发重连",
+                          w->id, PONG_TIMEOUT);
+                __atomic_store_n(&w->shared_peer->authenticated, 0,
+                                __ATOMIC_SEQ_CST);
+                continue;
+            }
+        }
     }
 
     log_info("client worker[%d]: 线程退出", w->id);

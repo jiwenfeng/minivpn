@@ -294,7 +294,9 @@ static void *server_worker_thread(void *arg)
                     }
 
                     case FRAME_PONG:
-                        log_debug("server worker[%d]: 收到 PONG", w->id);
+                        /* 更新 peer 地址（客户端可能 NAT 端口变化） */
+                        shared_peer_update_addr(w->shared_peer, &src_addrs[j]);
+                        log_info("server worker[%d]: 收到 PONG", w->id);
                         break;
 
                     default:
