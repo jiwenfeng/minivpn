@@ -102,12 +102,12 @@ static void *server_worker_thread(void *arg)
     /* Worker 0 负责服务端主动 PING 保活 */
     time_t last_srv_ping_time = time(NULL);
 
-    while (__atomic_load_n(&w->running, __ATOMIC_SEQ_CST) && g_server_running) {
+    while (__atomic_load_n(&w->running, __ATOMIC_ACQUIRE) && g_server_running) {
 
         /* 服务端主动 PING：只有 Worker 0 在已认证时定期发送 PING 到客户端，
          * 保持 server→client 方向的 NAT 映射活跃 */
         if (w->id == 0 &&
-            __atomic_load_n(&w->shared_peer->authenticated, __ATOMIC_SEQ_CST)) {
+            __atomic_load_n(&w->shared_peer->authenticated, __ATOMIC_ACQUIRE)) {
             time_t now = time(NULL);
             if (now - last_srv_ping_time >= SRV_PING_INTERVAL) {
                 struct sockaddr_storage peer;
@@ -213,7 +213,7 @@ static void *server_worker_thread(void *arg)
                         shared_peer_replay_reset(w->shared_peer);
 
                         __atomic_store_n(&w->shared_peer->authenticated, 1,
-                                        __ATOMIC_SEQ_CST);
+                                        __ATOMIC_RELEASE);
 
                         log_info("server worker[%d]: 客户端已认证: %s",
                                  w->id, addr_str);
@@ -245,14 +245,20 @@ static void *server_worker_thread(void *arg)
                     case FRAME_DATA: {
                         /* DATA 帧：写入 TUN */
                         if (!__atomic_load_n(&w->shared_peer->authenticated,
-                                             __ATOMIC_SEQ_CST)) {
+                                             __ATOMIC_ACQUIRE)) {
                             log_debug("server worker[%d]: 收到 DATA 但未认证，丢弃",
                                       w->id);
                             continue;
                         }
 
-                        /* 更新 peer 地址（可能发生 NAT 变更） */
-                        shared_peer_update_addr(w->shared_peer, &src_addrs[j]);
+                        /* 仅在地址变化时更新（避免频繁加锁） */
+                        {
+                            struct sockaddr_storage cur_addr;
+                            shared_peer_get_addr(w->shared_peer, &cur_addr);
+                            if (memcmp(&cur_addr, &src_addrs[j], addr_len) != 0) {
+                                shared_peer_update_addr(w->shared_peer, &src_addrs[j]);
+                            }
+                        }
 
                         if (payload_len > 0) {
                             ssize_t wn = write(w->tun_fd, decrypt_payload,
@@ -273,11 +279,17 @@ static void *server_worker_thread(void *arg)
                     case FRAME_PING: {
                         /* PING 帧：回复 PONG */
                         if (!__atomic_load_n(&w->shared_peer->authenticated,
-                                             __ATOMIC_SEQ_CST))
+                                             __ATOMIC_ACQUIRE))
                             continue;
 
-                        /* 更新 peer 地址 */
-                        shared_peer_update_addr(w->shared_peer, &src_addrs[j]);
+                        /* 仅在地址变化时更新（避免频繁加锁） */
+                        {
+                            struct sockaddr_storage cur_addr;
+                            shared_peer_get_addr(w->shared_peer, &cur_addr);
+                            if (memcmp(&cur_addr, &src_addrs[j], addr_len) != 0) {
+                                shared_peer_update_addr(w->shared_peer, &src_addrs[j]);
+                            }
+                        }
 
                         int pong_len = protocol_encrypt(w->crypto, FRAME_PONG,
                                                         NULL, 0,
@@ -294,8 +306,14 @@ static void *server_worker_thread(void *arg)
                     }
 
                     case FRAME_PONG:
-                        /* 更新 peer 地址（客户端可能 NAT 端口变化） */
-                        shared_peer_update_addr(w->shared_peer, &src_addrs[j]);
+                        /* 仅在地址变化时更新（避免频繁加锁） */
+                        {
+                            struct sockaddr_storage cur_addr;
+                            shared_peer_get_addr(w->shared_peer, &cur_addr);
+                            if (memcmp(&cur_addr, &src_addrs[j], addr_len) != 0) {
+                                shared_peer_update_addr(w->shared_peer, &src_addrs[j]);
+                            }
+                        }
                         log_info("server worker[%d]: 收到 PONG", w->id);
                         break;
 
@@ -309,7 +327,7 @@ static void *server_worker_thread(void *arg)
             } else if (fd == w->tun_fd && (events[i].events & EPOLLIN)) {
                 /* ==== TUN 批量读取 + sendmmsg 批量发送 ==== */
                 if (!__atomic_load_n(&w->shared_peer->authenticated,
-                                     __ATOMIC_SEQ_CST)) {
+                                     __ATOMIC_ACQUIRE)) {
                     /* 未认证，排空 TUN 数据避免积压 */
                     for (int k = 0; k < BATCH_SIZE; k++) {
                         if (read(w->tun_fd, tun_buf, sizeof(tun_buf)) <= 0)
@@ -347,16 +365,24 @@ static void *server_worker_thread(void *arg)
                 }
 
                 if (batch_count > 0) {
-                    int sent = sendmmsg(w->udp_fd, send_msgs,
-                                        batch_count, 0);
-                    if (sent < 0) {
-                        if (errno != EAGAIN) {
+                    int total_sent = 0;
+                    while (total_sent < batch_count) {
+                        int sent = sendmmsg(w->udp_fd,
+                                            send_msgs + total_sent,
+                                            batch_count - total_sent, 0);
+                        if (sent < 0) {
+                            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                                break;  /* 缓冲区满，放弃剩余 */
+                            }
                             log_error("server worker[%d]: sendmmsg 失败: %s",
                                       w->id, strerror(errno));
+                            break;
                         }
-                    } else if (sent < batch_count) {
+                        total_sent += sent;
+                    }
+                    if (total_sent < batch_count) {
                         log_debug("server worker[%d]: sendmmsg 部分发送: %d/%d",
-                                  w->id, sent, batch_count);
+                                  w->id, total_sent, batch_count);
                     }
                 }
             }

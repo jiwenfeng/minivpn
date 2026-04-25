@@ -34,8 +34,7 @@ struct shared_peer_state {
     volatile long last_active_time;   /* 上次收到有效帧的时间戳 (__atomic 访问，所有 Worker 共享） */
     struct sockaddr_storage peer_addr;/* 对端地址（IPv4 或 IPv6） */
     pthread_mutex_t addr_mutex;       /* 保护 peer_addr 更新 */
-    struct replay_window replay;      /* 共享抗重放窗口 */
-    pthread_mutex_t replay_mutex;     /* 保护 replay 窗口 */
+    struct replay_window replay;      /* 无锁抗重放窗口 (atomic CAS) */
 };
 
 struct worker {

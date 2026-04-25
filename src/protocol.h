@@ -10,6 +10,7 @@
 
 #include <stdint.h>
 #include <openssl/evp.h>
+#include <openssl/opensslv.h>
 
 /* 帧类型 */
 #define FRAME_DATA  0x01
@@ -58,6 +59,11 @@ struct crypto_ctx {
     EVP_CIPHER_CTX *dec_ctx;     /* 解密上下文 */
     uint8_t encrypt_key[KEY_SIZE];
     uint8_t auth_key[KEY_SIZE];
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+    EVP_MAC *hmac_mac;           /* 预分配 HMAC MAC 对象 */
+    EVP_MAC_CTX *hmac_ctx;       /* 预分配 HMAC CTX */
+#endif
 
     /* 随机数缓冲区 */
     uint8_t rand_buf[RAND_BUF_SIZE];

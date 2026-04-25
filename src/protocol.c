@@ -90,11 +90,12 @@ static int rand_buf_get(struct crypto_ctx *ctx, uint8_t *out, int len)
 }
 
 /*
- * 生成12字节 Nonce: 8字节递增计数器(大端) + 4字节随机
+ * 生成12字节 Nonce: 8字节递增计数器(大端) + 4字节填0
  */
 static int generate_nonce(struct crypto_ctx *ctx, uint8_t *nonce)
 {
-    uint64_t counter = __atomic_fetch_add(&s_nonce_counter, 1, __ATOMIC_SEQ_CST);
+    (void)ctx;
+    uint64_t counter = __atomic_fetch_add(&s_nonce_counter, 1, __ATOMIC_RELAXED);
 
     /* 前8字节: 大端序计数器 */
     nonce[0] = (uint8_t)(counter >> 56);
@@ -106,10 +107,11 @@ static int generate_nonce(struct crypto_ctx *ctx, uint8_t *nonce)
     nonce[6] = (uint8_t)(counter >> 8);
     nonce[7] = (uint8_t)(counter);
 
-    /* 后4字节: 随机 (从缓冲区获取) */
-    if (rand_buf_get(ctx, nonce + 8, 4) != 0) {
-        return -1;
-    }
+    /* 后4字节: 填0 (唯一性已由计数器保证) */
+    nonce[8] = 0;
+    nonce[9] = 0;
+    nonce[10] = 0;
+    nonce[11] = 0;
 
     return 0;
 }
@@ -143,43 +145,48 @@ int replay_window_check(struct replay_window *rw, const uint8_t *nonce)
     if (!rw || !nonce) return -1;
 
     uint64_t seq = nonce_to_seq(nonce);
+    if (seq == 0) return -1;
 
-    if (seq == 0) {
-        /* 序列号 0 是特殊值 (初始化前)，拒绝 */
-        return -1;
-    }
+    /* 读取当前 max_seq */
+    uint64_t cur_max = __atomic_load_n(&rw->max_seq, __ATOMIC_ACQUIRE);
 
-    if (seq > rw->max_seq) {
-        /* 新的最大序列号，前移窗口 */
-        uint64_t diff = seq - rw->max_seq;
-        if (diff >= REPLAY_WINDOW_SIZE) {
-            /* 差距太大，清空整个窗口 */
-            memset(rw->bitmap, 0, sizeof(rw->bitmap));
-        } else {
-            /* 清除新的区间中的位 */
-            for (uint64_t i = rw->max_seq + 1; i <= seq; i++) {
-                uint64_t idx = i % REPLAY_WINDOW_SIZE;
-                rw->bitmap[idx / 64] &= ~(1ULL << (idx % 64));
+    if (seq > cur_max) {
+        /* 尝试 CAS 更新 max_seq */
+        while (seq > cur_max) {
+            if (__atomic_compare_exchange_n(&rw->max_seq, &cur_max, seq,
+                                            0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                /* 成功更新 max_seq，清除新区间的位 */
+                uint64_t diff = seq - cur_max;
+                if (diff >= REPLAY_WINDOW_SIZE) {
+                    /* 差距太大，清空整个窗口 */
+                    for (int i = 0; i < REPLAY_WINDOW_SIZE / 64; i++) {
+                        __atomic_store_n(&rw->bitmap[i], 0, __ATOMIC_RELAXED);
+                    }
+                } else {
+                    for (uint64_t i = cur_max + 1; i <= seq; i++) {
+                        uint64_t idx = i % REPLAY_WINDOW_SIZE;
+                        uint64_t mask = 1ULL << (idx % 64);
+                        __atomic_fetch_and(&rw->bitmap[idx / 64], ~mask, __ATOMIC_RELAXED);
+                    }
+                }
+                break;
             }
+            /* CAS 失败，cur_max 已更新，重新检查 */
         }
-        rw->max_seq = seq;
-    } else if (rw->max_seq - seq >= REPLAY_WINDOW_SIZE) {
-        /* 太旧，超出窗口范围 */
-        log_debug("replay_window: 序列号太旧: %llu (当前最大: %llu)",
-                  (unsigned long long)seq, (unsigned long long)rw->max_seq);
+    } else if (cur_max - seq >= REPLAY_WINDOW_SIZE) {
+        /* 太旧，超出窗口 */
         return -1;
     }
 
-    /* 检查是否已经收到过 */
+    /* 原子 test-and-set 位图 */
     uint64_t idx = seq % REPLAY_WINDOW_SIZE;
     uint64_t mask = 1ULL << (idx % 64);
-    if (rw->bitmap[idx / 64] & mask) {
-        log_debug("replay_window: 检测到重放: seq=%llu", (unsigned long long)seq);
+    uint64_t old = __atomic_fetch_or(&rw->bitmap[idx / 64], mask, __ATOMIC_ACQ_REL);
+    if (old & mask) {
+        /* 已经收到过 */
         return -1;
     }
 
-    /* 标记为已收到 */
-    rw->bitmap[idx / 64] |= mask;
     return 0;
 }
 
@@ -226,6 +233,29 @@ static int hmac_sha256_oneshot(const uint8_t *key, int key_len,
     EVP_MAC_CTX_free(ctx);
     EVP_MAC_free(mac);
     return ret;
+}
+
+/*
+ * 复用预分配 HMAC 上下文的版本（用于 protocol_make_auth / protocol_verify_auth）
+ */
+static int hmac_sha256_ctx(struct crypto_ctx *cctx,
+                           const uint8_t *data, int data_len,
+                           uint8_t *out, unsigned int *out_len)
+{
+    OSSL_PARAM params[] = {
+        OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST, "SHA256", 0),
+        OSSL_PARAM_END
+    };
+
+    if (EVP_MAC_init(cctx->hmac_ctx, cctx->auth_key, KEY_SIZE, params) != 1)
+        return -1;
+    if (EVP_MAC_update(cctx->hmac_ctx, data, (size_t)data_len) != 1)
+        return -1;
+    size_t mac_len = HMAC_SIZE;
+    if (EVP_MAC_final(cctx->hmac_ctx, out, &mac_len, HMAC_SIZE) != 1)
+        return -1;
+    *out_len = (unsigned int)mac_len;
+    return 0;
 }
 
 #else /* Legacy HMAC API */
@@ -443,6 +473,12 @@ struct crypto_ctx *crypto_ctx_new(const uint8_t *encrypt_key,
         return NULL;
     }
 
+    /* 预初始化 cipher 和 IV 长度，避免每帧重复设置 */
+    EVP_EncryptInit_ex(ctx->enc_ctx, EVP_aes_256_gcm(), NULL, NULL, NULL);
+    EVP_CIPHER_CTX_ctrl(ctx->enc_ctx, EVP_CTRL_GCM_SET_IVLEN, NONCE_SIZE, NULL);
+    EVP_DecryptInit_ex(ctx->dec_ctx, EVP_aes_256_gcm(), NULL, NULL, NULL);
+    EVP_CIPHER_CTX_ctrl(ctx->dec_ctx, EVP_CTRL_GCM_SET_IVLEN, NONCE_SIZE, NULL);
+
     /* 预填充随机缓冲区 */
     if (RAND_bytes(ctx->rand_buf, RAND_BUF_SIZE) != 1) {
         log_error("crypto_ctx_new: 初始化随机缓冲区失败");
@@ -450,6 +486,21 @@ struct crypto_ctx *crypto_ctx_new(const uint8_t *encrypt_key,
         return NULL;
     }
     ctx->rand_offset = 0;
+
+#if USE_EVP_MAC
+    ctx->hmac_mac = EVP_MAC_fetch(NULL, "HMAC", NULL);
+    if (!ctx->hmac_mac) {
+        log_error("crypto_ctx_new: EVP_MAC_fetch 失败");
+        crypto_ctx_free(ctx);
+        return NULL;
+    }
+    ctx->hmac_ctx = EVP_MAC_CTX_new(ctx->hmac_mac);
+    if (!ctx->hmac_ctx) {
+        log_error("crypto_ctx_new: EVP_MAC_CTX_new 失败");
+        crypto_ctx_free(ctx);
+        return NULL;
+    }
+#endif
 
     return ctx;
 }
@@ -459,6 +510,10 @@ void crypto_ctx_free(struct crypto_ctx *ctx)
     if (!ctx) return;
     if (ctx->enc_ctx) EVP_CIPHER_CTX_free(ctx->enc_ctx);
     if (ctx->dec_ctx) EVP_CIPHER_CTX_free(ctx->dec_ctx);
+#if USE_EVP_MAC
+    if (ctx->hmac_ctx) EVP_MAC_CTX_free(ctx->hmac_ctx);
+    if (ctx->hmac_mac) EVP_MAC_free(ctx->hmac_mac);
+#endif
     OPENSSL_cleanse(ctx->encrypt_key, KEY_SIZE);
     OPENSSL_cleanse(ctx->auth_key, KEY_SIZE);
     OPENSSL_cleanse(ctx->rand_buf, RAND_BUF_SIZE);
@@ -482,12 +537,17 @@ int protocol_encrypt(struct crypto_ctx *ctx, uint8_t type,
         return -1;
     }
 
-    /* 生成随机 padding 长度 (0~255) */
+    /* 生成随机 padding 长度 */
     uint8_t pad_len_byte;
     if (rand_buf_get(ctx, &pad_len_byte, 1) != 0) {
         return -1;
     }
-    int pad_len = (int)pad_len_byte;
+    int pad_len;
+    if (type == FRAME_DATA) {
+        pad_len = (int)(pad_len_byte & 0x0F);  /* 0~15 字节 */
+    } else {
+        pad_len = (int)pad_len_byte;  /* 0~255 字节 */
+    }
 
     /* 明文 = Type(1B) + Len(2B) + Payload + Padding */
     int plaintext_len = FRAME_HEADER + payload_len + pad_len;
@@ -536,10 +596,6 @@ int protocol_encrypt(struct crypto_ctx *ctx, uint8_t type,
     int len = 0;
 
     do {
-        if (EVP_EncryptInit_ex(enc, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1)
-            break;
-        if (EVP_CIPHER_CTX_ctrl(enc, EVP_CTRL_GCM_SET_IVLEN, NONCE_SIZE, NULL) != 1)
-            break;
         if (EVP_EncryptInit_ex(enc, NULL, NULL, ctx->encrypt_key, nonce) != 1)
             break;
         if (EVP_EncryptUpdate(enc, ciphertext, &len, plaintext, plaintext_len) != 1)
@@ -552,7 +608,9 @@ int protocol_encrypt(struct crypto_ctx *ctx, uint8_t type,
         ret = frame_len;
     } while (0);
 
-    OPENSSL_cleanse(plaintext, plaintext_len);
+    if (type != FRAME_DATA) {
+        OPENSSL_cleanse(plaintext, plaintext_len);
+    }
 
     if (ret < 0) {
         log_error("protocol_encrypt: AES-GCM 加密失败");
@@ -594,10 +652,6 @@ int protocol_decrypt(struct crypto_ctx *ctx,
     int len = 0;
 
     do {
-        if (EVP_DecryptInit_ex(dec, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1)
-            break;
-        if (EVP_CIPHER_CTX_ctrl(dec, EVP_CTRL_GCM_SET_IVLEN, NONCE_SIZE, NULL) != 1)
-            break;
         if (EVP_DecryptInit_ex(dec, NULL, NULL, ctx->encrypt_key, nonce) != 1)
             break;
         if (EVP_DecryptUpdate(dec, plaintext, &len, ciphertext, ciphertext_len) != 1)
@@ -630,7 +684,9 @@ int protocol_decrypt(struct crypto_ctx *ctx,
         ret = 0;
     } while (0);
 
-    OPENSSL_cleanse(plaintext, ciphertext_len);
+    if (*type != FRAME_DATA) {
+        OPENSSL_cleanse(plaintext, ciphertext_len);
+    }
 
     return ret;
 }
@@ -663,9 +719,14 @@ int protocol_make_auth(struct crypto_ctx *ctx,
     /* HMAC-SHA256(auth_key, ts || nonce) */
     unsigned int hmac_len = HMAC_SIZE;
     int data_len = AUTH_TS_SIZE + AUTH_NONCE_SIZE;
+#if USE_EVP_MAC
+    if (hmac_sha256_ctx(ctx, out, data_len,
+                        out + data_len, &hmac_len) != 0) {
+#else
     if (hmac_sha256_oneshot(ctx->auth_key, KEY_SIZE,
                             out, data_len,
                             out + data_len, &hmac_len) != 0) {
+#endif
         log_error("protocol_make_auth: HMAC 计算失败");
         return -1;
     }
@@ -711,9 +772,14 @@ int protocol_verify_auth(struct crypto_ctx *ctx,
     int hmac_input_len = AUTH_TS_SIZE + AUTH_NONCE_SIZE;
     uint8_t expected_hmac[HMAC_SIZE];
     unsigned int hmac_len = HMAC_SIZE;
+#if USE_EVP_MAC
+    if (hmac_sha256_ctx(ctx, data, hmac_input_len,
+                        expected_hmac, &hmac_len) != 0) {
+#else
     if (hmac_sha256_oneshot(ctx->auth_key, KEY_SIZE,
                             data, hmac_input_len,
                             expected_hmac, &hmac_len) != 0) {
+#endif
         log_error("protocol_verify_auth: HMAC 计算失败");
         return -1;
     }

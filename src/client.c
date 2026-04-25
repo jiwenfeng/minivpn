@@ -147,10 +147,10 @@ static int client_reconnect_socket(struct worker *w,
     shared_peer_replay_reset(w->shared_peer);
 
     /* 清除认证状态 */
-    __atomic_store_n(&w->shared_peer->authenticated, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&w->shared_peer->authenticated, 0, __ATOMIC_RELEASE);
 
     /* 递增重连代数，通知所有 Worker 重建 socket */
-    __atomic_fetch_add(&w->shared_peer->reconnect_gen, 1, __ATOMIC_SEQ_CST);
+    __atomic_fetch_add(&w->shared_peer->reconnect_gen, 1, __ATOMIC_RELEASE);
 
     return 0;
 }
@@ -165,7 +165,7 @@ static int client_authenticate(struct worker *w)
     uint8_t recv_buf[MAX_FRAME_SIZE];
 
     for (int retry = 0; retry < AUTH_RETRY_MAX; retry++) {
-        if (!__atomic_load_n(&w->running, __ATOMIC_SEQ_CST) || !g_client_running)
+        if (!__atomic_load_n(&w->running, __ATOMIC_ACQUIRE) || !g_client_running)
             return -1;
 
         /* 每次重试都生成新的 AUTH 帧内容（刷新时间戳和 nonce） */
@@ -206,7 +206,7 @@ static int client_authenticate(struct worker *w)
         time_t deadline = time(NULL) + AUTH_TIMEOUT;
 
         while (time(NULL) < deadline &&
-               __atomic_load_n(&w->running, __ATOMIC_SEQ_CST) &&
+               __atomic_load_n(&w->running, __ATOMIC_ACQUIRE) &&
                g_client_running) {
             int timeout_ms = (int)(deadline - time(NULL)) * 1000;
             if (timeout_ms <= 0) break;
@@ -244,7 +244,7 @@ static int client_authenticate(struct worker *w)
 
                 if (frame_type == FRAME_OK) {
                     __atomic_store_n(&w->shared_peer->authenticated, 1,
-                                    __ATOMIC_SEQ_CST);
+                                    __ATOMIC_RELEASE);
                     log_info("client worker[%d]: 认证成功，收到 OK 帧",
                              w->id);
                     return 0;
@@ -277,9 +277,13 @@ static void *client_worker_thread(void *arg)
     struct iovec send_iovs[BATCH_SIZE];
     struct mmsghdr send_msgs[BATCH_SIZE];
 
+    /* ---- recvmmsg 批量接收缓冲区 ---- */
+    uint8_t udp_recv_bufs[BATCH_SIZE][MAX_FRAME_SIZE];
+    struct iovec recv_iovs[BATCH_SIZE];
+    struct mmsghdr recv_msgs[BATCH_SIZE];
+
     /* ---- drain loop 复用缓冲区 ---- */
     uint8_t tun_buf[MAX_PAYLOAD];
-    uint8_t udp_recv_buf[MAX_FRAME_SIZE];
     uint8_t decrypt_payload[MAX_PAYLOAD];
     uint8_t ctrl_send_buf[MAX_FRAME_SIZE]; /* 控制帧发送 */
 
@@ -291,11 +295,20 @@ static void *client_worker_thread(void *arg)
         /* msg_name = NULL, msg_namelen = 0 (已 connect) */
     }
 
+    /* 初始化 recvmmsg 结构 (客户端已 connect，不需要 msg_name) */
+    memset(recv_msgs, 0, sizeof(recv_msgs));
+    for (int k = 0; k < BATCH_SIZE; k++) {
+        recv_iovs[k].iov_base = udp_recv_bufs[k];
+        recv_iovs[k].iov_len = MAX_FRAME_SIZE;
+        recv_msgs[k].msg_hdr.msg_iov = &recv_iovs[k];
+        recv_msgs[k].msg_hdr.msg_iovlen = 1;
+    }
+
     log_info("client worker[%d]: 线程开始运行", w->id);
 
     /* 初始化本 Worker 的重连代数 */
     ctx->local_gen = __atomic_load_n(&w->shared_peer->reconnect_gen,
-                                     __ATOMIC_SEQ_CST);
+                                     __ATOMIC_ACQUIRE);
 
     /* 只有 Worker 0 负责首次认证 */
     if (w->id == 0) {
@@ -304,24 +317,24 @@ static void *client_worker_thread(void *arg)
         }
     } else {
         /* 其他 Worker 等待 Worker 0 完成认证 */
-        while (__atomic_load_n(&w->running, __ATOMIC_SEQ_CST) &&
+        while (__atomic_load_n(&w->running, __ATOMIC_ACQUIRE) &&
                g_client_running &&
                !__atomic_load_n(&w->shared_peer->authenticated,
-                                __ATOMIC_SEQ_CST)) {
+                                __ATOMIC_ACQUIRE)) {
             usleep(100000);  /* 100ms */
         }
     }
 
     ctx->last_ping_time = time(NULL);
     __atomic_store_n(&w->shared_peer->last_active_time, (long)time(NULL),
-                     __ATOMIC_SEQ_CST);
+                     __ATOMIC_RELEASE);
 
-    while (__atomic_load_n(&w->running, __ATOMIC_SEQ_CST) && g_client_running) {
+    while (__atomic_load_n(&w->running, __ATOMIC_ACQUIRE) && g_client_running) {
 
         /* 非 Worker 0: 检查是否需要跟随重连代数重建 socket */
         if (w->id != 0) {
             uint64_t cur_gen = __atomic_load_n(&w->shared_peer->reconnect_gen,
-                                               __ATOMIC_SEQ_CST);
+                                               __ATOMIC_ACQUIRE);
             if (cur_gen != ctx->local_gen) {
                 log_info("client worker[%d]: 检测到重连代数变化 (%llu -> %llu)，重建 socket",
                          w->id, (unsigned long long)ctx->local_gen,
@@ -337,27 +350,27 @@ static void *client_worker_thread(void *arg)
                 log_info("client worker[%d]: socket 重建完成", w->id);
 
                 /* 等待 Worker 0 完成认证 */
-                while (__atomic_load_n(&w->running, __ATOMIC_SEQ_CST) &&
+                while (__atomic_load_n(&w->running, __ATOMIC_ACQUIRE) &&
                        g_client_running &&
                        !__atomic_load_n(&w->shared_peer->authenticated,
-                                        __ATOMIC_SEQ_CST)) {
+                                        __ATOMIC_ACQUIRE)) {
                     usleep(100000);  /* 100ms */
                 }
                 ctx->last_ping_time = time(NULL);
                 __atomic_store_n(&w->shared_peer->last_active_time,
-                                 (long)time(NULL), __ATOMIC_SEQ_CST);
+                                 (long)time(NULL), __ATOMIC_RELEASE);
                 continue;
             }
         }
 
         /* 检查是否需要重连 (只有 Worker 0 负责重连决策) */
         if (!__atomic_load_n(&w->shared_peer->authenticated,
-                             __ATOMIC_SEQ_CST)) {
+                             __ATOMIC_ACQUIRE)) {
             if (w->id == 0) {
                 log_info("client worker[%d]: 开始重连...", w->id);
                 sleep(RECONNECT_DELAY);
 
-                if (!__atomic_load_n(&w->running, __ATOMIC_SEQ_CST) ||
+                if (!__atomic_load_n(&w->running, __ATOMIC_ACQUIRE) ||
                     !g_client_running)
                     break;
 
@@ -368,7 +381,7 @@ static void *client_worker_thread(void *arg)
 
                 /* 同步 Worker 0 自身的代数 */
                 ctx->local_gen = __atomic_load_n(
-                    &w->shared_peer->reconnect_gen, __ATOMIC_SEQ_CST);
+                    &w->shared_peer->reconnect_gen, __ATOMIC_ACQUIRE);
 
                 if (client_authenticate(w) != 0) {
                     log_error("client worker[%d]: 重连认证失败", w->id);
@@ -377,7 +390,7 @@ static void *client_worker_thread(void *arg)
 
                 ctx->last_ping_time = time(NULL);
                 __atomic_store_n(&w->shared_peer->last_active_time,
-                                 (long)time(NULL), __ATOMIC_SEQ_CST);
+                                 (long)time(NULL), __ATOMIC_RELEASE);
                 log_info("client worker[%d]: 重连成功", w->id);
             } else {
                 /* 非 Worker 0 等待认证恢复（重建 socket 由代数检查处理） */
@@ -424,7 +437,7 @@ static void *client_worker_thread(void *arg)
             if (fd == w->tun_fd && (events[i].events & EPOLLIN)) {
                 /* ==== TUN 批量读取 + sendmmsg 批量发送 ==== */
                 if (!__atomic_load_n(&w->shared_peer->authenticated,
-                                     __ATOMIC_SEQ_CST)) {
+                                     __ATOMIC_ACQUIRE)) {
                     /* 未认证，排空 TUN 避免积压 */
                     for (int k = 0; k < BATCH_SIZE; k++) {
                         if (read(w->tun_fd, tun_buf, sizeof(tun_buf)) <= 0)
@@ -455,30 +468,46 @@ static void *client_worker_thread(void *arg)
                 }
 
                 if (batch_count > 0) {
-                    int sent = sendmmsg(w->udp_fd, send_msgs,
-                                        batch_count, 0);
-                    if (sent < 0) {
-                        if (errno != EAGAIN) {
+                    int total_sent = 0;
+                    while (total_sent < batch_count) {
+                        int sent = sendmmsg(w->udp_fd,
+                                            send_msgs + total_sent,
+                                            batch_count - total_sent, 0);
+                        if (sent < 0) {
+                            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                                break;  /* 缓冲区满，放弃剩余 */
+                            }
                             log_error("client worker[%d]: sendmmsg 失败: %s",
                                       w->id, strerror(errno));
+                            break;
                         }
-                    } else if (sent < batch_count) {
+                        total_sent += sent;
+                    }
+                    if (total_sent < batch_count) {
                         log_debug("client worker[%d]: sendmmsg 部分发送: %d/%d",
-                                  w->id, sent, batch_count);
+                                  w->id, total_sent, batch_count);
                     }
                 }
 
             } else if (fd == w->udp_fd && (events[i].events & EPOLLIN)) {
-                /* ==== UDP drain loop：批量接收 + 处理 ==== */
-                for (int k = 0; k < BATCH_SIZE; k++) {
-                    ssize_t n = recv(w->udp_fd, udp_recv_buf,
-                                     sizeof(udp_recv_buf), MSG_DONTWAIT);
-                    if (n <= 0) break;
+                /* ==== UDP 批量接收 (recvmmsg) ==== */
+                int npkts = recvmmsg(w->udp_fd, recv_msgs, BATCH_SIZE,
+                                     MSG_DONTWAIT, NULL);
+                if (npkts <= 0) {
+                    if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                        log_error("client worker[%d]: recvmmsg 失败: %s",
+                                  w->id, strerror(errno));
+                    }
+                    continue;
+                }
+
+                for (int j = 0; j < npkts; j++) {
+                    int n = (int)recv_msgs[j].msg_len;
 
                     uint8_t frame_type;
                     int payload_len = 0;
 
-                    if (protocol_decrypt(w->crypto, udp_recv_buf, (int)n,
+                    if (protocol_decrypt(w->crypto, udp_recv_bufs[j], n,
                                          &frame_type, decrypt_payload,
                                          &payload_len) != 0) {
                         log_debug("client worker[%d]: 解密失败，丢弃帧",
@@ -488,7 +517,7 @@ static void *client_worker_thread(void *arg)
 
                     /* 抗重放检查 (共享窗口，线程安全) */
                     if (shared_peer_replay_check(w->shared_peer,
-                                                 udp_recv_buf) != 0) {
+                                                 udp_recv_bufs[j]) != 0) {
                         log_debug("client worker[%d]: 检测到重放帧，丢弃",
                                   w->id);
                         continue;
@@ -496,7 +525,7 @@ static void *client_worker_thread(void *arg)
 
                     /* 收到任何有效帧都更新共享活跃时间（任何 Worker 均可更新） */
                     __atomic_store_n(&w->shared_peer->last_active_time,
-                                    (long)time(NULL), __ATOMIC_SEQ_CST);
+                                    (long)time(NULL), __ATOMIC_RELEASE);
 
                     switch (frame_type) {
                     case FRAME_DATA:
@@ -543,7 +572,7 @@ static void *client_worker_thread(void *arg)
                                   w->id, frame_type);
                         break;
                     }
-                } /* end drain loop */
+                } /* end for npkts */
             }
         } /* end for nfds */
 
@@ -551,12 +580,12 @@ static void *client_worker_thread(void *arg)
         if (w->id == 0) {
             time_t now = time(NULL);
             long shared_active = __atomic_load_n(&w->shared_peer->last_active_time,
-                                                 __ATOMIC_SEQ_CST);
+                                                 __ATOMIC_ACQUIRE);
             if (now - (time_t)shared_active > PONG_TIMEOUT) {
                 log_error("client worker[%d]: PONG 超时 (%d 秒)，触发重连",
                           w->id, PONG_TIMEOUT);
                 __atomic_store_n(&w->shared_peer->authenticated, 0,
-                                __ATOMIC_SEQ_CST);
+                                __ATOMIC_RELEASE);
                 continue;
             }
         }

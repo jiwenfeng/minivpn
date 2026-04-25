@@ -5,7 +5,7 @@
  *
  * 改进:
  * - 所有 Worker 都监听 TUN 设备（使用 EPOLLEXCLUSIVE 减少惊群）
- * - 共享认证状态 + 共享抗重放窗口（mutex 保护）
+ * - 共享认证状态 + 无锁抗重放窗口（atomic CAS）
  * - 独立的 crypto_ctx（每个 Worker 无锁加解密）
  * - 支持 IPv4/IPv6 双栈（sockaddr_storage）
  */
@@ -38,10 +38,6 @@ int shared_peer_init(struct shared_peer_state *state)
         return -1;
     }
     replay_window_init(&state->replay);
-    if (pthread_mutex_init(&state->replay_mutex, NULL) != 0) {
-        pthread_mutex_destroy(&state->addr_mutex);
-        return -1;
-    }
     return 0;
 }
 
@@ -49,7 +45,6 @@ void shared_peer_destroy(struct shared_peer_state *state)
 {
     if (!state) return;
     pthread_mutex_destroy(&state->addr_mutex);
-    pthread_mutex_destroy(&state->replay_mutex);
 }
 
 void shared_peer_update_addr(struct shared_peer_state *state,
@@ -74,18 +69,15 @@ int shared_peer_replay_check(struct shared_peer_state *state,
                              const uint8_t *nonce)
 {
     if (!state || !nonce) return -1;
-    pthread_mutex_lock(&state->replay_mutex);
-    int ret = replay_window_check(&state->replay, nonce);
-    pthread_mutex_unlock(&state->replay_mutex);
-    return ret;
+    /* 无锁：replay_window_check 内部使用 atomic 操作 */
+    return replay_window_check(&state->replay, nonce);
 }
 
 void shared_peer_replay_reset(struct shared_peer_state *state)
 {
     if (!state) return;
-    pthread_mutex_lock(&state->replay_mutex);
+    /* reset 仅在重连时由 Worker 0 调用，此时其他 Worker 尚未活跃 */
     replay_window_init(&state->replay);
-    pthread_mutex_unlock(&state->replay_mutex);
 }
 
 /* ========== Worker 实现 ========== */
@@ -106,7 +98,7 @@ int worker_init(struct worker *w, int id, int tun_fd, int af,
     w->epoll_fd = -1;
     w->af = af;
     w->shared_peer = shared_peer;
-    __atomic_store_n(&w->running, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&w->running, 0, __ATOMIC_RELEASE);
     w->user_data = NULL;
 
     /* 创建独立的加密上下文 */
@@ -210,12 +202,12 @@ int worker_start(struct worker *w, void *(*thread_func)(void *))
         return -1;
     }
 
-    __atomic_store_n(&w->running, 1, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&w->running, 1, __ATOMIC_RELEASE);
 
     int ret = pthread_create(&w->thread, NULL, thread_func, w);
     if (ret != 0) {
         log_error("worker[%d]: 创建线程失败, errno=%d", w->id, ret);
-        __atomic_store_n(&w->running, 0, __ATOMIC_SEQ_CST);
+        __atomic_store_n(&w->running, 0, __ATOMIC_RELEASE);
         return -1;
     }
 
@@ -227,8 +219,8 @@ void worker_stop(struct worker *w)
 {
     if (!w) return;
 
-    if (__atomic_load_n(&w->running, __ATOMIC_SEQ_CST)) {
-        __atomic_store_n(&w->running, 0, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&w->running, __ATOMIC_ACQUIRE)) {
+        __atomic_store_n(&w->running, 0, __ATOMIC_RELEASE);
         log_info("worker[%d]: 正在停止...", w->id);
         pthread_join(w->thread, NULL);
         log_info("worker[%d]: 线程已退出", w->id);
