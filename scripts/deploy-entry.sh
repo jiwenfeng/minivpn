@@ -294,9 +294,7 @@ ms-dns 223.5.5.5
 ms-dns 119.29.29.29
 asyncmap 0
 auth
-lock
 hide-password
-local
 name l2tpd
 proxyarp
 lcp-echo-interval 30

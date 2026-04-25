@@ -189,6 +189,13 @@ static int client_authenticate(struct worker *w)
         if (sn < 0) {
             log_error("client worker[%d]: 发送 AUTH 失败: %s",
                       w->id, strerror(errno));
+            if (errno == ECONNREFUSED) {
+                /* ICMP Port Unreachable: 远端未监听，继续重试 */
+                log_info("client worker[%d]: 远端端口不可达，%d 秒后重试...",
+                         w->id, AUTH_TIMEOUT);
+                sleep(AUTH_TIMEOUT);
+                continue;
+            }
             return -1;
         }
 
