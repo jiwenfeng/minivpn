@@ -8,7 +8,7 @@
  * 4. epoll 事件循环：
  *    - TUN 可读：drain loop 批量读 IP 包 → 加密 → sendmmsg 批量发送
  *    - UDP 可读：drain loop 批量 recv → 解密 → 批量写 TUN
- * 5. 心跳：每 30 秒 PING，90 秒超时断线重连
+ * 5. 心跳：每 10 秒 PING，90 秒无有效帧超时断线重连
  *
  * 改进:
  * - 共享认证状态
@@ -56,7 +56,7 @@ static void client_signal_handler(int sig)
 
 #define MAX_EVENTS       64
 #define BATCH_SIZE       32    /* drain loop / sendmmsg 批量大小 */
-#define PING_INTERVAL    30   /* 心跳间隔 (秒) */
+#define PING_INTERVAL    10   /* 心跳间隔 (秒) */
 #define PONG_TIMEOUT     90   /* PONG 超时 (秒) */
 #define AUTH_TIMEOUT     10   /* AUTH 等待 OK 超时 (秒) */
 #define AUTH_RETRY_MAX   5    /* AUTH 最大重试次数 */
@@ -68,7 +68,6 @@ struct client_worker_ctx {
     struct worker *w;
     struct sockaddr_storage remote_addr;  /* 远端地址（IPv4 或 IPv6） */
     time_t last_ping_time;                /* 上次发送 PING 的时间 */
-    time_t last_pong_time;                /* 上次收到 PONG 的时间 */
     uint64_t local_gen;                   /* 本 Worker 已同步的重连代数 */
 };
 
@@ -314,7 +313,7 @@ static void *client_worker_thread(void *arg)
     }
 
     ctx->last_ping_time = time(NULL);
-    __atomic_store_n(&w->shared_peer->last_pong_time, (long)time(NULL),
+    __atomic_store_n(&w->shared_peer->last_active_time, (long)time(NULL),
                      __ATOMIC_SEQ_CST);
 
     while (__atomic_load_n(&w->running, __ATOMIC_SEQ_CST) && g_client_running) {
@@ -345,7 +344,7 @@ static void *client_worker_thread(void *arg)
                     usleep(100000);  /* 100ms */
                 }
                 ctx->last_ping_time = time(NULL);
-                __atomic_store_n(&w->shared_peer->last_pong_time,
+                __atomic_store_n(&w->shared_peer->last_active_time,
                                  (long)time(NULL), __ATOMIC_SEQ_CST);
                 continue;
             }
@@ -377,7 +376,7 @@ static void *client_worker_thread(void *arg)
                 }
 
                 ctx->last_ping_time = time(NULL);
-                __atomic_store_n(&w->shared_peer->last_pong_time,
+                __atomic_store_n(&w->shared_peer->last_active_time,
                                  (long)time(NULL), __ATOMIC_SEQ_CST);
                 log_info("client worker[%d]: 重连成功", w->id);
             } else {
@@ -398,17 +397,22 @@ static void *client_worker_thread(void *arg)
                                                 ctrl_send_buf,
                                                 sizeof(ctrl_send_buf));
                 if (ping_len > 0) {
-                    send(w->udp_fd, ctrl_send_buf, ping_len, 0);
-                    log_debug("client worker[%d]: 发送 PING", w->id);
+                    ssize_t ps = send(w->udp_fd, ctrl_send_buf, ping_len, 0);
+                    if (ps < 0) {
+                        log_error("client worker[%d]: 发送 PING 失败: %s",
+                                  w->id, strerror(errno));
+                    } else {
+                        log_debug("client worker[%d]: 发送 PING", w->id);
+                    }
                 }
                 ctx->last_ping_time = now;
             }
 
-            /* PONG 超时检测（读取共享的 last_pong_time，任何 Worker 收到 PONG 都会更新） */
-            long shared_pong = __atomic_load_n(&w->shared_peer->last_pong_time,
-                                               __ATOMIC_SEQ_CST);
-            if (now - (time_t)shared_pong > PONG_TIMEOUT) {
-                log_error("client worker[%d]: PONG 超时 (%d 秒)，触发重连",
+            /* 活跃超时检测（读取共享的 last_active_time，任何 Worker 收到有效帧都会更新） */
+            long shared_active = __atomic_load_n(&w->shared_peer->last_active_time,
+                                                 __ATOMIC_SEQ_CST);
+            if (now - (time_t)shared_active > PONG_TIMEOUT) {
+                log_error("client worker[%d]: 活跃超时 (%d 秒无任何有效帧)，触发重连",
                           w->id, PONG_TIMEOUT);
                 __atomic_store_n(&w->shared_peer->authenticated, 0,
                                 __ATOMIC_SEQ_CST);
@@ -501,6 +505,10 @@ static void *client_worker_thread(void *arg)
                         continue;
                     }
 
+                    /* 收到任何有效帧都更新共享活跃时间（任何 Worker 均可更新） */
+                    __atomic_store_n(&w->shared_peer->last_active_time,
+                                    (long)time(NULL), __ATOMIC_SEQ_CST);
+
                     switch (frame_type) {
                     case FRAME_DATA:
                         if (payload_len > 0) {
@@ -519,9 +527,6 @@ static void *client_worker_thread(void *arg)
                         break;
 
                     case FRAME_PONG:
-                        /* 更新共享的 last_pong_time（任何 Worker 都可能收到 PONG） */
-                        __atomic_store_n(&w->shared_peer->last_pong_time,
-                                        (long)time(NULL), __ATOMIC_SEQ_CST);
                         log_debug("client worker[%d]: 收到 PONG", w->id);
                         break;
 
@@ -703,7 +708,6 @@ int client_run(const struct vpn_config *cfg)
         ctxs[i].w = &workers[i];
         memcpy(&ctxs[i].remote_addr, &remote_addr, sizeof(remote_addr));
         ctxs[i].last_ping_time = time(NULL);
-        ctxs[i].last_pong_time = time(NULL);
         workers[i].user_data = &ctxs[i];
 
         if (worker_start(&workers[i], client_worker_thread) != 0) {

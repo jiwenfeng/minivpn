@@ -30,6 +30,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include <errno.h>
+#include <time.h>
 #include <net/if.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
@@ -51,8 +52,9 @@ static void server_signal_handler(int sig)
 
 /* ========== 常量 ========== */
 
-#define MAX_EVENTS  64
-#define BATCH_SIZE  32    /* recvmmsg/sendmmsg 批量大小 */
+#define MAX_EVENTS      64
+#define BATCH_SIZE      32    /* recvmmsg/sendmmsg 批量大小 */
+#define SRV_PING_INTERVAL 10  /* 服务端主动 PING 间隔 (秒)，保持双向 NAT 映射 */
 
 /* ========== 服务端 Worker 线程函数 ========== */
 
@@ -97,7 +99,39 @@ static void *server_worker_thread(void *arg)
 
     log_info("server worker[%d]: 线程开始运行", w->id);
 
+    /* Worker 0 负责服务端主动 PING 保活 */
+    time_t last_srv_ping_time = time(NULL);
+
     while (__atomic_load_n(&w->running, __ATOMIC_SEQ_CST) && g_server_running) {
+
+        /* 服务端主动 PING：只有 Worker 0 在已认证时定期发送 PING 到客户端，
+         * 保持 server→client 方向的 NAT 映射活跃 */
+        if (w->id == 0 &&
+            __atomic_load_n(&w->shared_peer->authenticated, __ATOMIC_SEQ_CST)) {
+            time_t now = time(NULL);
+            if (now - last_srv_ping_time >= SRV_PING_INTERVAL) {
+                struct sockaddr_storage peer;
+                shared_peer_get_addr(w->shared_peer, &peer);
+                socklen_t peer_len = sockaddr_len(&peer);
+
+                int ping_len = protocol_encrypt(w->crypto, FRAME_PING,
+                                                NULL, 0,
+                                                ctrl_send_buf,
+                                                sizeof(ctrl_send_buf));
+                if (ping_len > 0) {
+                    ssize_t ps = sendto(w->udp_fd, ctrl_send_buf, ping_len, 0,
+                                        (struct sockaddr *)&peer, peer_len);
+                    if (ps < 0) {
+                        log_error("server worker[%d]: 发送 PING 失败: %s",
+                                  w->id, strerror(errno));
+                    } else {
+                        log_debug("server worker[%d]: 发送 PING 到客户端", w->id);
+                    }
+                }
+                last_srv_ping_time = now;
+            }
+        }
+
         int nfds = epoll_wait(w->epoll_fd, events, MAX_EVENTS, 1000);
         if (nfds < 0) {
             if (errno == EINTR) continue;
@@ -173,6 +207,11 @@ static void *server_worker_thread(void *arg)
 
                         /* 更新共享认证状态 */
                         shared_peer_update_addr(w->shared_peer, &src_addrs[j]);
+
+                        /* 重置抗重放窗口：客户端重连后 nonce 计数器可能变化，
+                         * 旧的重放窗口会错误拒绝新帧 */
+                        shared_peer_replay_reset(w->shared_peer);
+
                         __atomic_store_n(&w->shared_peer->authenticated, 1,
                                         __ATOMIC_SEQ_CST);
 

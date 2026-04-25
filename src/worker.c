@@ -32,7 +32,7 @@ int shared_peer_init(struct shared_peer_state *state)
     if (!state) return -1;
     state->authenticated = 0;
     state->reconnect_gen = 0;
-    state->last_pong_time = (long)time(NULL);
+    state->last_active_time = (long)time(NULL);
     memset(&state->peer_addr, 0, sizeof(state->peer_addr));
     if (pthread_mutex_init(&state->addr_mutex, NULL) != 0) {
         return -1;
