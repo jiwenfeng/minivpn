@@ -1,6 +1,6 @@
 CC      = gcc
-CFLAGS  = -O2 -Wall -Wextra -Wpedantic -D_GNU_SOURCE -std=c99
-LDFLAGS = -lcrypto -lpthread
+CFLAGS  = -O2 -Wall -Wextra -Wpedantic -D_GNU_SOURCE -std=c99 -pthread
+LDFLAGS = -lcrypto -pthread
 
 SRCS    = src/main.c src/server.c src/client.c src/worker.c src/tun.c src/protocol.c
 OBJS    = $(SRCS:.c=.o)
@@ -19,7 +19,7 @@ src/%.o: src/%.c $(HEADERS)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Debug 构建
-debug: CFLAGS = -g -O0 -Wall -Wextra -Wpedantic -DDEBUG -D_GNU_SOURCE -std=c99 -fsanitize=address
+debug: CFLAGS = -g -O0 -Wall -Wextra -Wpedantic -DDEBUG -D_GNU_SOURCE -std=c99 -pthread -fsanitize=address
 debug: LDFLAGS += -fsanitize=address
 debug: $(TARGET)
 
@@ -27,6 +27,7 @@ clean:
 	rm -f $(OBJS) $(TARGET)
 
 install: $(TARGET)
+	strip $(TARGET)
 	install -m 755 $(TARGET) /usr/local/bin/
 	mkdir -p /etc/minivpn
 

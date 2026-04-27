@@ -567,6 +567,8 @@ int main(int argc, char *argv[])
     vcfg.threads = cfg.threads;
     vcfg.mtu = cfg.mtu > 0 ? cfg.mtu : 1400;
     snprintf(vcfg.secret, sizeof(vcfg.secret), "%s", cfg.secret);
+    /* 立即擦除 app_config 中的密钥副本 */
+    OPENSSL_cleanse(cfg.secret, sizeof(cfg.secret));
     snprintf(vcfg.tun_ip, sizeof(vcfg.tun_ip), "%s", cfg.tun_ip);
     snprintf(vcfg.tun_peer, sizeof(vcfg.tun_peer), "%s", cfg.tun_peer);
     snprintf(vcfg.tun_ip6, sizeof(vcfg.tun_ip6), "%s", cfg.tun_ip6);
@@ -586,12 +588,7 @@ int main(int argc, char *argv[])
         }
 
         /* 确定地址族：显式 --ipv6 > 地址格式自动检测 */
-        if (cfg.ipv6)
-            vcfg.af = AF_INET6;
-        else if (is_ipv6)
-            vcfg.af = AF_INET6;
-        else
-            vcfg.af = AF_INET;
+        vcfg.af = (cfg.ipv6 || is_ipv6) ? AF_INET6 : AF_INET;
 
         const char *af_str = (vcfg.af == AF_INET6) ? "IPv6" : "IPv4";
         log_info("启动服务端模式: 监听 %s:%d (%s), TUN %s <-> %s, "
@@ -618,12 +615,7 @@ int main(int argc, char *argv[])
         }
 
         /* 确定地址族 */
-        if (cfg.ipv6)
-            vcfg.af = AF_INET6;
-        else if (is_ipv6)
-            vcfg.af = AF_INET6;
-        else
-            vcfg.af = AF_INET;
+        vcfg.af = (cfg.ipv6 || is_ipv6) ? AF_INET6 : AF_INET;
 
         const char *af_str = (vcfg.af == AF_INET6) ? "IPv6" : "IPv4";
         log_info("启动客户端模式: 远端 %s:%d (%s), TUN %s <-> %s, "

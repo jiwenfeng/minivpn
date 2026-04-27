@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/wait.h>
@@ -190,23 +191,38 @@ int tun_configure_ipv6(const char *dev_name, const char *local_ip6,
     }
 
     /*
-     * 使用 ip 命令配置 IPv6 地址（比 ioctl 更简洁可靠）
+     * 使用 fork/execvp 配置 IPv6 地址（比 system() 更安全，无需 shell）
      * ioctl 对 IPv6 支持有限，netlink 或 ip 命令更合适
      */
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd),
-             "ip -6 addr add %s/%d dev %s 2>&1",
-             local_ip6, prefix_len, dev_name);
+    char prefix_str[8];
+    snprintf(prefix_str, sizeof(prefix_str), "%d", prefix_len);
 
-    int ret = system(cmd);
-    if (ret != 0) {
+    char addr_prefix[80];
+    snprintf(addr_prefix, sizeof(addr_prefix), "%s/%s", local_ip6, prefix_str);
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        log_error("tun_configure_ipv6: fork 失败: %s", strerror(errno));
+        return -1;
+    }
+
+    if (pid == 0) {
+        /* 子进程：执行 ip -6 addr add <addr>/<prefix> dev <dev> */
+        execlp("ip", "ip", "-6", "addr", "add", addr_prefix, "dev", dev_name, NULL);
+        _exit(127);  /* exec 失败 */
+    }
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+
+    if (status != 0) {
         /* 错误码 2 通常表示地址已存在 (RTNETLINK answers: File exists)，可忽略 */
-        if (WIFEXITED(ret) && WEXITSTATUS(ret) == 2) {
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 2) {
             log_info("tun_configure_ipv6: IPv6 地址已存在，跳过: %s/%d",
                      local_ip6, prefix_len);
         } else {
             log_error("tun_configure_ipv6: 配置 IPv6 地址失败 (exit=%d): %s/%d",
-                      WIFEXITED(ret) ? WEXITSTATUS(ret) : -1,
+                      WIFEXITED(status) ? WEXITSTATUS(status) : -1,
                       local_ip6, prefix_len);
             return -1;
         }

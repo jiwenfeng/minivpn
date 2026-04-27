@@ -415,7 +415,7 @@ static void *client_worker_thread(void *arg)
                         log_error("client worker[%d]: 发送 PING 失败: %s",
                                   w->id, strerror(errno));
                     } else {
-                        log_info("client worker[%d]: 发送 PING", w->id);
+                        log_debug("client worker[%d]: 发送 PING", w->id);
                     }
                 }
                 ctx->last_ping_time = now;
@@ -545,7 +545,7 @@ static void *client_worker_thread(void *arg)
                         break;
 
                     case FRAME_PONG:
-                        log_info("client worker[%d]: 收到 PONG", w->id);
+                        log_debug("client worker[%d]: 收到 PONG", w->id);
                         break;
 
                     case FRAME_OK:
@@ -555,7 +555,7 @@ static void *client_worker_thread(void *arg)
 
                     case FRAME_PING: {
                         /* 服务端发来的 PING，回复 PONG */
-                        log_info("client worker[%d]: 收到服务端 PING，回复 PONG", w->id);
+                        log_debug("client worker[%d]: 收到服务端 PING，回复 PONG", w->id);
                         int pong_len = protocol_encrypt(w->crypto,
                                                         FRAME_PONG,
                                                         NULL, 0,

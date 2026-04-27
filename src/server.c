@@ -56,6 +56,22 @@ static void server_signal_handler(int sig)
 #define BATCH_SIZE      32    /* recvmmsg/sendmmsg 批量大小 */
 #define SRV_PING_INTERVAL 10  /* 服务端主动 PING 间隔 (秒)，保持双向 NAT 映射 */
 
+/* ========== 辅助函数 ========== */
+
+/*
+ * 仅在地址变化时更新共享 peer 地址（避免频繁加锁）
+ */
+static void server_maybe_update_addr(struct shared_peer_state *sp,
+                                     const struct sockaddr_storage *new_addr,
+                                     socklen_t addr_len)
+{
+    struct sockaddr_storage cur_addr;
+    shared_peer_get_addr(sp, &cur_addr);
+    if (memcmp(&cur_addr, new_addr, addr_len) != 0) {
+        shared_peer_update_addr(sp, new_addr);
+    }
+}
+
 /* ========== 服务端 Worker 线程函数 ========== */
 
 static void *server_worker_thread(void *arg)
@@ -251,14 +267,7 @@ static void *server_worker_thread(void *arg)
                             continue;
                         }
 
-                        /* 仅在地址变化时更新（避免频繁加锁） */
-                        {
-                            struct sockaddr_storage cur_addr;
-                            shared_peer_get_addr(w->shared_peer, &cur_addr);
-                            if (memcmp(&cur_addr, &src_addrs[j], addr_len) != 0) {
-                                shared_peer_update_addr(w->shared_peer, &src_addrs[j]);
-                            }
-                        }
+                        server_maybe_update_addr(w->shared_peer, &src_addrs[j], addr_len);
 
                         if (payload_len > 0) {
                             ssize_t wn = write(w->tun_fd, decrypt_payload,
@@ -282,14 +291,7 @@ static void *server_worker_thread(void *arg)
                                              __ATOMIC_ACQUIRE))
                             continue;
 
-                        /* 仅在地址变化时更新（避免频繁加锁） */
-                        {
-                            struct sockaddr_storage cur_addr;
-                            shared_peer_get_addr(w->shared_peer, &cur_addr);
-                            if (memcmp(&cur_addr, &src_addrs[j], addr_len) != 0) {
-                                shared_peer_update_addr(w->shared_peer, &src_addrs[j]);
-                            }
-                        }
+                        server_maybe_update_addr(w->shared_peer, &src_addrs[j], addr_len);
 
                         int pong_len = protocol_encrypt(w->crypto, FRAME_PONG,
                                                         NULL, 0,
@@ -306,15 +308,8 @@ static void *server_worker_thread(void *arg)
                     }
 
                     case FRAME_PONG:
-                        /* 仅在地址变化时更新（避免频繁加锁） */
-                        {
-                            struct sockaddr_storage cur_addr;
-                            shared_peer_get_addr(w->shared_peer, &cur_addr);
-                            if (memcmp(&cur_addr, &src_addrs[j], addr_len) != 0) {
-                                shared_peer_update_addr(w->shared_peer, &src_addrs[j]);
-                            }
-                        }
-                        log_info("server worker[%d]: 收到 PONG", w->id);
+                        server_maybe_update_addr(w->shared_peer, &src_addrs[j], addr_len);
+                        log_debug("server worker[%d]: 收到 PONG", w->id);
                         break;
 
                     default:

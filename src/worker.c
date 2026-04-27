@@ -51,7 +51,9 @@ void shared_peer_update_addr(struct shared_peer_state *state,
     if (!state || !addr) return;
     unsigned int seq = __atomic_load_n(&state->addr_seq, __ATOMIC_RELAXED);
     __atomic_store_n(&state->addr_seq, seq + 1, __ATOMIC_RELEASE); /* 奇数=写入中 */
+    __atomic_thread_fence(__ATOMIC_RELEASE);  /* 确保 seq+1 对读者可见后再写数据 */
     memcpy(&state->peer_addr, addr, sizeof(state->peer_addr));
+    __atomic_thread_fence(__ATOMIC_RELEASE);  /* 确保数据写入完成后再更新 seq */
     __atomic_store_n(&state->addr_seq, seq + 2, __ATOMIC_RELEASE); /* 偶数=完成 */
 }
 
@@ -63,7 +65,9 @@ void shared_peer_get_addr(struct shared_peer_state *state,
     do {
         seq1 = __atomic_load_n(&state->addr_seq, __ATOMIC_ACQUIRE);
         if (seq1 & 1) continue;  /* 写入中，重试 */
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);  /* 确保 seq1 读取完成后再读数据 */
         memcpy(addr, &state->peer_addr, sizeof(*addr));
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);  /* 确保数据读取完成后再读 seq2 */
         seq2 = __atomic_load_n(&state->addr_seq, __ATOMIC_ACQUIRE);
     } while (seq1 != seq2);
 }

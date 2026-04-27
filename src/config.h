@@ -25,7 +25,6 @@ struct vpn_config {
     int port;                      /* 端口 */
     int af;                        /* 地址族: AF_INET 或 AF_INET6 */
     char secret[256];              /* 预共享密钥 */
-    char secret_file[256];         /* 密钥文件路径（优先于 secret 字段） */
     char tun_ip[64];               /* TUN 设备本端 IP（IPv4 或 IPv6） */
     char tun_peer[64];             /* TUN 设备对端 IP（IPv4 或 IPv6） */
     char tun_ip6[64];              /* TUN 设备本端 IPv6 地址（可选，双栈时使用） */

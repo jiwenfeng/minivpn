@@ -226,7 +226,7 @@ generate_routes_v4() {
 generate_routes_v6() {
     if [[ "$HAS_IPV6" -ne 1 ]]; then
         info "跳过 IPv6 路由生成（无IPv6默认路由）"
-        echo "0" > "$BATCH_FILE_V6"
+        > "$BATCH_FILE_V6"
         echo "0"
         return
     fi

@@ -684,7 +684,7 @@ int protocol_decrypt(struct crypto_ctx *ctx,
         ret = 0;
     } while (0);
 
-    if (*type != FRAME_DATA) {
+    if (ret == 0 && *type != FRAME_DATA) {
         OPENSSL_cleanse(plaintext, ciphertext_len);
     }
 

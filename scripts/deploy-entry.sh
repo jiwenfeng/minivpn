@@ -508,7 +508,6 @@ init_smart_routes() {
     # 当在线下载不可用时（国内服务器可能无法直接访问 APNIC），
     # 使用项目自带的精简 CN IP 列表作为降级方案
     local data_dir="/var/lib/minivpn"
-    local fallback_file="${data_dir}/delegated-apnic-fallback"
     local local_file_opt=""
 
     # 检查是否已有缓存数据
@@ -530,88 +529,27 @@ init_smart_routes() {
 
     warn "在线下载APNIC数据失败，尝试本地降级方案..."
 
-    # 降级方案：生成一个精简的本地 APNIC 数据文件
-    # 包含中国主要的 IPv4 地址段（CIDR 聚合后约 30 条主要段）
-    # 这些是中国三大运营商和主要云服务商的核心地址段
+    # 降级方案：使用项目自带的 APNIC 数据文件
+    # 文件位于 scripts/delegated-apnic-latest，在 build_minivpn() 中已复制到 /opt/minivpn/scripts/
     mkdir -p "$data_dir"
-    if [[ ! -f "$fallback_file" ]]; then
-        info "生成本地降级 APNIC 数据..."
-        cat > "$fallback_file" <<'FALLBACK_DATA'
-apnic|CN|ipv4|1.0.1.0|256|20110414|allocated
-apnic|CN|ipv4|1.0.2.0|512|20110414|allocated
-apnic|CN|ipv4|1.0.8.0|2048|20110414|allocated
-apnic|CN|ipv4|1.0.32.0|8192|20110414|allocated
-apnic|CN|ipv4|1.1.0.0|256|20110414|allocated
-apnic|CN|ipv4|1.1.2.0|512|20110414|allocated
-apnic|CN|ipv4|1.1.4.0|1024|20110414|allocated
-apnic|CN|ipv4|1.1.8.0|2048|20110414|allocated
-apnic|CN|ipv4|1.2.0.0|65536|20110414|allocated
-apnic|CN|ipv4|1.4.1.0|256|20110414|allocated
-apnic|CN|ipv4|1.4.2.0|512|20110414|allocated
-apnic|CN|ipv4|1.4.4.0|1024|20110414|allocated
-apnic|CN|ipv4|1.4.8.0|2048|20110414|allocated
-apnic|CN|ipv4|1.4.16.0|4096|20110414|allocated
-apnic|CN|ipv4|1.4.32.0|8192|20110414|allocated
-apnic|CN|ipv4|1.4.64.0|16384|20110414|allocated
-apnic|CN|ipv4|14.0.0.0|131072|20110414|allocated
-apnic|CN|ipv4|14.16.0.0|1048576|20110414|allocated
-apnic|CN|ipv4|27.0.0.0|2097152|20110414|allocated
-apnic|CN|ipv4|36.0.0.0|16777216|20110414|allocated
-apnic|CN|ipv4|39.0.0.0|16777216|20110414|allocated
-apnic|CN|ipv4|42.0.0.0|16777216|20110414|allocated
-apnic|CN|ipv4|49.0.0.0|8388608|20110414|allocated
-apnic|CN|ipv4|58.0.0.0|8388608|20110414|allocated
-apnic|CN|ipv4|59.32.0.0|4194304|20110414|allocated
-apnic|CN|ipv4|60.0.0.0|16777216|20110414|allocated
-apnic|CN|ipv4|61.0.0.0|8388608|20110414|allocated
-apnic|CN|ipv4|101.0.0.0|8388608|20110414|allocated
-apnic|CN|ipv4|103.0.0.0|8388608|20110414|allocated
-apnic|CN|ipv4|106.0.0.0|16777216|20110414|allocated
-apnic|CN|ipv4|110.0.0.0|16777216|20110414|allocated
-apnic|CN|ipv4|111.0.0.0|16777216|20110414|allocated
-apnic|CN|ipv4|112.0.0.0|16777216|20110414|allocated
-apnic|CN|ipv4|113.0.0.0|16777216|20110414|allocated
-apnic|CN|ipv4|114.0.0.0|16777216|20110414|allocated
-apnic|CN|ipv4|115.0.0.0|16777216|20110414|allocated
-apnic|CN|ipv4|116.0.0.0|16777216|20110414|allocated
-apnic|CN|ipv4|117.0.0.0|16777216|20110414|allocated
-apnic|CN|ipv4|118.0.0.0|16777216|20110414|allocated
-apnic|CN|ipv4|119.0.0.0|16777216|20110414|allocated
-apnic|CN|ipv4|120.0.0.0|16777216|20110414|allocated
-apnic|CN|ipv4|121.0.0.0|16777216|20110414|allocated
-apnic|CN|ipv4|122.0.0.0|16777216|20110414|allocated
-apnic|CN|ipv4|123.0.0.0|16777216|20110414|allocated
-apnic|CN|ipv4|124.0.0.0|16777216|20110414|allocated
-apnic|CN|ipv4|125.0.0.0|16777216|20110414|allocated
-apnic|CN|ipv4|139.0.0.0|8388608|20110414|allocated
-apnic|CN|ipv4|140.0.0.0|8388608|20110414|allocated
-apnic|CN|ipv4|144.0.0.0|4194304|20110414|allocated
-apnic|CN|ipv4|150.0.0.0|4194304|20110414|allocated
-apnic|CN|ipv4|153.0.0.0|4194304|20110414|allocated
-apnic|CN|ipv4|157.0.0.0|4194304|20110414|allocated
-apnic|CN|ipv4|159.224.0.0|65536|20110414|allocated
-apnic|CN|ipv4|171.0.0.0|8388608|20110414|allocated
-apnic|CN|ipv4|175.0.0.0|16777216|20110414|allocated
-apnic|CN|ipv4|180.0.0.0|16777216|20110414|allocated
-apnic|CN|ipv4|182.0.0.0|16777216|20110414|allocated
-apnic|CN|ipv4|183.0.0.0|16777216|20110414|allocated
-apnic|CN|ipv4|202.0.0.0|4194304|20110414|allocated
-apnic|CN|ipv4|210.0.0.0|4194304|20110414|allocated
-apnic|CN|ipv4|211.64.0.0|2097152|20110414|allocated
-apnic|CN|ipv4|218.0.0.0|4194304|20110414|allocated
-apnic|CN|ipv4|219.128.0.0|2097152|20110414|allocated
-apnic|CN|ipv4|220.96.0.0|4194304|20110414|allocated
-apnic|CN|ipv4|221.0.0.0|4194304|20110414|allocated
-apnic|CN|ipv4|222.0.0.0|4194304|20110414|allocated
-apnic|CN|ipv4|223.0.0.0|4194304|20110414|allocated
-FALLBACK_DATA
-        info "降级数据文件已生成: ${fallback_file}（$(wc -l < "$fallback_file") 条记录）"
+    local bundled_apnic=""
+
+    # 按优先级查找项目自带的 APNIC 数据文件
+    if [[ -f "${script_dir}/delegated-apnic-latest" ]]; then
+        bundled_apnic="${script_dir}/delegated-apnic-latest"
+    elif [[ -f "/opt/minivpn/scripts/delegated-apnic-latest" ]]; then
+        bundled_apnic="/opt/minivpn/scripts/delegated-apnic-latest"
     fi
 
-    # 使用降级文件运行路由更新
-    info "使用本地降级数据更新路由..."
-    bash "$routes_script" -f "$fallback_file" || \
-        warn "降级路由更新也失败了，请手动检查 update-routes.sh 脚本"
+    if [[ -n "$bundled_apnic" ]] && grep -q '|CN|' "$bundled_apnic" 2>/dev/null; then
+        info "使用项目自带的 APNIC 数据文件: ${bundled_apnic}"
+        cp "$bundled_apnic" "${data_dir}/delegated-apnic-latest"
+        bash "$routes_script" -f "${data_dir}/delegated-apnic-latest" || \
+            warn "降级路由更新失败，请手动检查 update-routes.sh 脚本"
+    else
+        warn "未找到可用的本地 APNIC 数据文件，跳过 CN 路由分流"
+        warn "请稍后手动下载 APNIC 数据并运行: update-routes.sh -f <文件路径>"
+    fi
 }
 
 # ─── 函数：创建systemd服务 ───────────────────────────────────────────────────
