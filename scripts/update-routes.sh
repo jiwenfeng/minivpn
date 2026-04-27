@@ -3,8 +3,9 @@ set -e
 
 ###############################################################################
 # update-routes.sh - APNIC中国大陆IP路由更新脚本（IPv4 + IPv6）
-# 用法: ./update-routes.sh
+# 用法: ./update-routes.sh [-f <本地APNIC文件>]
 # 功能: 从APNIC获取中国大陆IPv4/IPv6段，更新Linux策略路由表（热更新，无需重启）
+# 支持: 在线下载或使用手动上传的本地APNIC数据文件
 # 面向: Ubuntu 22.04+ / Debian 12+
 ###############################################################################
 
@@ -35,6 +36,41 @@ BATCH_FILE_V4="${DATA_DIR}/routes-cn-v4.batch"
 BATCH_FILE_V6="${DATA_DIR}/routes-cn-v6.batch"
 LOG_FILE="/var/log/minivpn-routes.log"
 TUN_DEV="tun0"
+LOCAL_APNIC_FILE=""           # 手动上传的本地APNIC数据文件路径
+
+# ─── 函数：解析参数 ──────────────────────────────────────────────────────────
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -f|--file)
+                LOCAL_APNIC_FILE="$2"
+                shift 2
+                ;;
+            -h|--help)
+                cat <<EOF
+用法: $0 [-f <本地APNIC文件>]
+
+参数:
+  -f, --file <path>   使用手动下载的本地APNIC数据文件（跳过在线下载）
+  -h, --help          显示此帮助信息
+
+示例:
+  $0                                           # 在线下载APNIC数据
+  $0 -f /tmp/delegated-apnic-latest            # 使用本地文件
+  $0 -f /root/delegated-apnic-latest           # 使用上传的文件
+
+手动下载APNIC数据:
+  在浏览器中访问以下URL下载，然后上传到服务器:
+  https://ftp.apnic.net/apnic/stats/apnic/delegated-apnic-latest
+EOF
+                exit 0
+                ;;
+            *)
+                fatal "未知参数: $1\n使用 -h 查看帮助"
+                ;;
+        esac
+    done
+}
 
 # ─── 函数：检查root权限 ─────────────────────────────────────────────────────
 check_root() {
@@ -110,8 +146,22 @@ get_tun_peer6() {
 
 # ─── 函数：下载APNIC数据 ────────────────────────────────────────────────────
 download_apnic() {
-    info "下载APNIC数据..."
     mkdir -p "$DATA_DIR"
+
+    # 如果指定了本地文件，直接使用
+    if [[ -n "$LOCAL_APNIC_FILE" ]]; then
+        if [[ ! -f "$LOCAL_APNIC_FILE" ]]; then
+            fatal "指定的本地文件不存在: $LOCAL_APNIC_FILE"
+        fi
+        if ! grep -q '|CN|' "$LOCAL_APNIC_FILE" 2>/dev/null; then
+            fatal "指定的文件不是有效的APNIC数据文件: $LOCAL_APNIC_FILE"
+        fi
+        cp "$LOCAL_APNIC_FILE" "$APNIC_FILE"
+        info "使用本地APNIC数据文件: ${LOCAL_APNIC_FILE} ($(wc -l < "$APNIC_FILE") 行)"
+        return
+    fi
+
+    info "下载APNIC数据..."
 
     local downloaded=0
     for url in "${APNIC_MIRROR_URLS[@]}"; do
@@ -264,18 +314,23 @@ setup_policy_rules() {
     info "配置策略路由规则..."
 
     # === IPv4 策略规则 ===
+    # 注意: ip rule show 输出 fwmark 为十六进制(0x64)，表名为别名(cn_direct/tunnel)
+    # 所以需要同时匹配十进制/十六进制和表ID/表名
+
+    local fwmark_hex
+    fwmark_hex=$(printf "0x%x" "$FWMARK")
 
     # 规则1: 带有 fwmark 标记的流量查 CN 路由表（中国IP直连）
-    if ! ip rule show | grep -q "fwmark ${FWMARK} lookup ${ROUTE_TABLE_CN}"; then
-        ip rule add fwmark "$FWMARK" table "$ROUTE_TABLE_CN" priority 100
+    if ! ip rule show | grep -qE "fwmark\s+(${FWMARK}|${fwmark_hex})\s+lookup\s+(${ROUTE_TABLE_CN}|cn_direct)"; then
+        ip rule add fwmark "$FWMARK" table "$ROUTE_TABLE_CN" priority 100 2>/dev/null || true
         info "已添加 IPv4 策略规则: fwmark ${FWMARK} -> table ${ROUTE_TABLE_CN}"
     else
         info "IPv4 策略规则(CN)已存在，跳过"
     fi
 
     # 规则2: 来自 VPN 客户端子网的流量查隧道路由表
-    if ! ip rule show | grep -q "from 10.10.10.0/24 lookup ${ROUTE_TABLE_TUNNEL}"; then
-        ip rule add from 10.10.10.0/24 table "$ROUTE_TABLE_TUNNEL" priority 200
+    if ! ip rule show | grep -qE "from\s+10\.10\.10\.0/24\s+lookup\s+(${ROUTE_TABLE_TUNNEL}|tunnel)"; then
+        ip rule add from 10.10.10.0/24 table "$ROUTE_TABLE_TUNNEL" priority 200 2>/dev/null || true
         info "已添加 IPv4 策略规则: from 10.10.10.0/24 -> table ${ROUTE_TABLE_TUNNEL}"
     else
         info "IPv4 策略规则(Tunnel)已存在，跳过"
@@ -289,8 +344,8 @@ setup_policy_rules() {
     # === IPv6 策略规则（如果有IPv6默认路由） ===
     if [[ "$HAS_IPV6" -eq 1 ]]; then
         # IPv6 fwmark 策略: 带标记的IPv6流量查 CN 路由表
-        if ! ip -6 rule show 2>/dev/null | grep -q "fwmark ${FWMARK} lookup ${ROUTE_TABLE_CN}"; then
-            ip -6 rule add fwmark "$FWMARK" table "$ROUTE_TABLE_CN" priority 100
+        if ! ip -6 rule show 2>/dev/null | grep -qE "fwmark\s+(${FWMARK}|${fwmark_hex})\s+lookup\s+(${ROUTE_TABLE_CN}|cn_direct)"; then
+            ip -6 rule add fwmark "$FWMARK" table "$ROUTE_TABLE_CN" priority 100 2>/dev/null || true
             info "已添加 IPv6 策略规则: fwmark ${FWMARK} -> table ${ROUTE_TABLE_CN}"
         else
             info "IPv6 策略规则(CN)已存在，跳过"
@@ -397,6 +452,7 @@ main() {
     echo ""
 
     check_root
+    parse_args "$@"
 
     # 文件锁：防止多个实例同时运行
     exec 200>/var/lock/minivpn-routes.lock

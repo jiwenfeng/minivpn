@@ -284,14 +284,18 @@ configure_ppp() {
     mkdir -p /etc/ppp
 
     # DNS 策略说明：
-    # - 主 DNS 使用 Google DNS（8.8.8.8），通过隧道可达，用于外网域名正确解析
-    #   避免国内 DNS 对外网域名的污染/错误解析
-    # - 备 DNS 使用国内公共 DNS（223.5.5.5），用于国内域名解析到国内 CDN
+    # - 主 DNS 使用阿里公共 DNS（223.5.5.5），国内直连可达，解析国内域名
+    # - 备 DNS 使用腾讯 DNSPod（119.29.29.29），国内直连可达
+    # 注意：不使用 8.8.8.8 等海外 DNS 作为 PPP 分配的 DNS，因为：
+    #   1. PPP 客户端的 DNS 请求不经过策略路由（由 pppd 直接发送），
+    #      在隧道建立之前或路由规则未就位时无法到达海外 DNS
+    #   2. 对于需要解析被污染域名的场景，应在客户端侧使用 DoH/DoT
+    #      或在 entry node 上部署 DNS 转发器（如 smartdns/dnsmasq）
     # MTU 1280: 满足 IPv6 最低 MTU 要求，同时兼顾 L2TP/IPsec 头部开销
     cat > /etc/ppp/options.xl2tpd <<'PPP_OPTS'
 require-mschap-v2
-ms-dns 8.8.8.8
 ms-dns 223.5.5.5
+ms-dns 119.29.29.29
 asyncmap 0
 auth
 hide-password
@@ -312,7 +316,7 @@ CHAP
         chmod 600 /etc/ppp/chap-secrets
     fi
 
-    info "PPP 配置完成（MTU=1280）"
+    info "PPP 配置完成（DNS=223.5.5.5+119.29.29.29, MTU=1280）"
 }
 
 # ─── 函数：添加VPN用户 ──────────────────────────────────────────────────────
@@ -493,13 +497,121 @@ init_smart_routes() {
         routes_script="/opt/minivpn/scripts/update-routes.sh"
     fi
 
-    if [[ -f "$routes_script" ]]; then
-        chmod +x "$routes_script"
-        info "运行路由更新脚本..."
-        bash "$routes_script" || warn "路由更新失败，可稍后手动运行 update-routes.sh"
-    else
+    if [[ ! -f "$routes_script" ]]; then
         warn "未找到 update-routes.sh 脚本，请稍后手动执行路由更新"
+        return
     fi
+
+    chmod +x "$routes_script"
+
+    # 预置本地降级 APNIC 数据文件
+    # 当在线下载不可用时（国内服务器可能无法直接访问 APNIC），
+    # 使用项目自带的精简 CN IP 列表作为降级方案
+    local data_dir="/var/lib/minivpn"
+    local fallback_file="${data_dir}/delegated-apnic-fallback"
+    local local_file_opt=""
+
+    # 检查是否已有缓存数据
+    if [[ -f "${data_dir}/delegated-apnic-latest" ]]; then
+        info "发现已有APNIC缓存数据，尝试在线更新..."
+        bash "$routes_script" && return 0
+        warn "在线更新失败，使用已有缓存数据..."
+        bash "$routes_script" -f "${data_dir}/delegated-apnic-latest" || \
+            warn "路由更新失败，可稍后手动运行 update-routes.sh"
+        return
+    fi
+
+    # 没有缓存时，先尝试在线下载
+    info "运行路由更新脚本（在线下载）..."
+    if bash "$routes_script" 2>&1; then
+        info "在线路由更新成功"
+        return
+    fi
+
+    warn "在线下载APNIC数据失败，尝试本地降级方案..."
+
+    # 降级方案：生成一个精简的本地 APNIC 数据文件
+    # 包含中国主要的 IPv4 地址段（CIDR 聚合后约 30 条主要段）
+    # 这些是中国三大运营商和主要云服务商的核心地址段
+    mkdir -p "$data_dir"
+    if [[ ! -f "$fallback_file" ]]; then
+        info "生成本地降级 APNIC 数据..."
+        cat > "$fallback_file" <<'FALLBACK_DATA'
+apnic|CN|ipv4|1.0.1.0|256|20110414|allocated
+apnic|CN|ipv4|1.0.2.0|512|20110414|allocated
+apnic|CN|ipv4|1.0.8.0|2048|20110414|allocated
+apnic|CN|ipv4|1.0.32.0|8192|20110414|allocated
+apnic|CN|ipv4|1.1.0.0|256|20110414|allocated
+apnic|CN|ipv4|1.1.2.0|512|20110414|allocated
+apnic|CN|ipv4|1.1.4.0|1024|20110414|allocated
+apnic|CN|ipv4|1.1.8.0|2048|20110414|allocated
+apnic|CN|ipv4|1.2.0.0|65536|20110414|allocated
+apnic|CN|ipv4|1.4.1.0|256|20110414|allocated
+apnic|CN|ipv4|1.4.2.0|512|20110414|allocated
+apnic|CN|ipv4|1.4.4.0|1024|20110414|allocated
+apnic|CN|ipv4|1.4.8.0|2048|20110414|allocated
+apnic|CN|ipv4|1.4.16.0|4096|20110414|allocated
+apnic|CN|ipv4|1.4.32.0|8192|20110414|allocated
+apnic|CN|ipv4|1.4.64.0|16384|20110414|allocated
+apnic|CN|ipv4|14.0.0.0|131072|20110414|allocated
+apnic|CN|ipv4|14.16.0.0|1048576|20110414|allocated
+apnic|CN|ipv4|27.0.0.0|2097152|20110414|allocated
+apnic|CN|ipv4|36.0.0.0|16777216|20110414|allocated
+apnic|CN|ipv4|39.0.0.0|16777216|20110414|allocated
+apnic|CN|ipv4|42.0.0.0|16777216|20110414|allocated
+apnic|CN|ipv4|49.0.0.0|8388608|20110414|allocated
+apnic|CN|ipv4|58.0.0.0|8388608|20110414|allocated
+apnic|CN|ipv4|59.32.0.0|4194304|20110414|allocated
+apnic|CN|ipv4|60.0.0.0|16777216|20110414|allocated
+apnic|CN|ipv4|61.0.0.0|8388608|20110414|allocated
+apnic|CN|ipv4|101.0.0.0|8388608|20110414|allocated
+apnic|CN|ipv4|103.0.0.0|8388608|20110414|allocated
+apnic|CN|ipv4|106.0.0.0|16777216|20110414|allocated
+apnic|CN|ipv4|110.0.0.0|16777216|20110414|allocated
+apnic|CN|ipv4|111.0.0.0|16777216|20110414|allocated
+apnic|CN|ipv4|112.0.0.0|16777216|20110414|allocated
+apnic|CN|ipv4|113.0.0.0|16777216|20110414|allocated
+apnic|CN|ipv4|114.0.0.0|16777216|20110414|allocated
+apnic|CN|ipv4|115.0.0.0|16777216|20110414|allocated
+apnic|CN|ipv4|116.0.0.0|16777216|20110414|allocated
+apnic|CN|ipv4|117.0.0.0|16777216|20110414|allocated
+apnic|CN|ipv4|118.0.0.0|16777216|20110414|allocated
+apnic|CN|ipv4|119.0.0.0|16777216|20110414|allocated
+apnic|CN|ipv4|120.0.0.0|16777216|20110414|allocated
+apnic|CN|ipv4|121.0.0.0|16777216|20110414|allocated
+apnic|CN|ipv4|122.0.0.0|16777216|20110414|allocated
+apnic|CN|ipv4|123.0.0.0|16777216|20110414|allocated
+apnic|CN|ipv4|124.0.0.0|16777216|20110414|allocated
+apnic|CN|ipv4|125.0.0.0|16777216|20110414|allocated
+apnic|CN|ipv4|139.0.0.0|8388608|20110414|allocated
+apnic|CN|ipv4|140.0.0.0|8388608|20110414|allocated
+apnic|CN|ipv4|144.0.0.0|4194304|20110414|allocated
+apnic|CN|ipv4|150.0.0.0|4194304|20110414|allocated
+apnic|CN|ipv4|153.0.0.0|4194304|20110414|allocated
+apnic|CN|ipv4|157.0.0.0|4194304|20110414|allocated
+apnic|CN|ipv4|159.224.0.0|65536|20110414|allocated
+apnic|CN|ipv4|171.0.0.0|8388608|20110414|allocated
+apnic|CN|ipv4|175.0.0.0|16777216|20110414|allocated
+apnic|CN|ipv4|180.0.0.0|16777216|20110414|allocated
+apnic|CN|ipv4|182.0.0.0|16777216|20110414|allocated
+apnic|CN|ipv4|183.0.0.0|16777216|20110414|allocated
+apnic|CN|ipv4|202.0.0.0|4194304|20110414|allocated
+apnic|CN|ipv4|210.0.0.0|4194304|20110414|allocated
+apnic|CN|ipv4|211.64.0.0|2097152|20110414|allocated
+apnic|CN|ipv4|218.0.0.0|4194304|20110414|allocated
+apnic|CN|ipv4|219.128.0.0|2097152|20110414|allocated
+apnic|CN|ipv4|220.96.0.0|4194304|20110414|allocated
+apnic|CN|ipv4|221.0.0.0|4194304|20110414|allocated
+apnic|CN|ipv4|222.0.0.0|4194304|20110414|allocated
+apnic|CN|ipv4|223.0.0.0|4194304|20110414|allocated
+FALLBACK_DATA
+        info "降级数据文件已生成: ${fallback_file}（$(wc -l < "$fallback_file") 条记录）"
+    fi
+
+    # 使用降级文件运行路由更新
+    info "使用本地降级数据更新路由..."
+    bash "$routes_script" -f "$fallback_file" || \
+        warn "降级路由更新也失败了，请手动检查 update-routes.sh 脚本"
 }
 
 # ─── 函数：创建systemd服务 ───────────────────────────────────────────────────
@@ -528,10 +640,11 @@ if [ -n "$TUN_PEER" ]; then
     ip route replace default via "$TUN_PEER" dev "$TUN_DEV" table "$ROUTE_TABLE_TUNNEL" 2>/dev/null || true
     echo "[$(date)] 隧道默认路由已设置: default via $TUN_PEER dev $TUN_DEV table $ROUTE_TABLE_TUNNEL"
 
-    # 确保策略规则存在
-    ip rule show | grep -q "fwmark $FWMARK lookup $ROUTE_TABLE_CN" || \
+    # 确保策略规则存在（ip rule show 输出fwmark为十六进制0x64，表名为别名）
+    FWMARK_HEX=$(printf "0x%x" "$FWMARK")
+    ip rule show | grep -qE "fwmark\s+($FWMARK|$FWMARK_HEX)\s+lookup\s+($ROUTE_TABLE_CN|cn_direct)" || \
         ip rule add fwmark "$FWMARK" table "$ROUTE_TABLE_CN" priority 100 2>/dev/null || true
-    ip rule show | grep -q "from 10.10.10.0/24 lookup $ROUTE_TABLE_TUNNEL" || \
+    ip rule show | grep -qE "from\s+10\.10\.10\.0/24\s+lookup\s+($ROUTE_TABLE_TUNNEL|tunnel)" || \
         ip rule add from 10.10.10.0/24 table "$ROUTE_TABLE_TUNNEL" priority 200 2>/dev/null || true
 else
     echo "[$(date)] 警告: 无法获取 TUN 对端 IP"

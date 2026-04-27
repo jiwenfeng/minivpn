@@ -238,9 +238,15 @@ setup_iptables() {
 
     # === IPv4 规则 ===
 
-    # POSTROUTING NAT（幂等：先检查是否已存在）
+    # POSTROUTING NAT - TUN 子网（幂等：先检查是否已存在）
     if ! iptables -t nat -C POSTROUTING -s "$tun_subnet" -o "$iface" -j MASQUERADE 2>/dev/null; then
         iptables -t nat -A POSTROUTING -s "$tun_subnet" -o "$iface" -j MASQUERADE
+    fi
+
+    # POSTROUTING NAT - PPP 客户端子网（近端 L2TP VPN 客户端流量经隧道过来后，
+    # 源地址为 10.10.10.x，需要在出口节点做 NAT 才能访问外网）
+    if ! iptables -t nat -C POSTROUTING -s 10.10.10.0/24 -o "$iface" -j MASQUERADE 2>/dev/null; then
+        iptables -t nat -A POSTROUTING -s 10.10.10.0/24 -o "$iface" -j MASQUERADE
     fi
 
     # FORWARD 规则（幂等）
@@ -249,6 +255,14 @@ setup_iptables() {
     fi
     if ! iptables -C FORWARD -d "$tun_subnet" -j ACCEPT 2>/dev/null; then
         iptables -A FORWARD -d "$tun_subnet" -j ACCEPT
+    fi
+
+    # FORWARD 规则 - PPP 客户端子网
+    if ! iptables -C FORWARD -s 10.10.10.0/24 -j ACCEPT 2>/dev/null; then
+        iptables -A FORWARD -s 10.10.10.0/24 -j ACCEPT
+    fi
+    if ! iptables -C FORWARD -d 10.10.10.0/24 -j ACCEPT 2>/dev/null; then
+        iptables -A FORWARD -d 10.10.10.0/24 -j ACCEPT
     fi
 
     # INPUT 放行 UDP 端口
